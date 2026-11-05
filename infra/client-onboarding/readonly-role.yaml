@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Read-only cross-account role for the engineering platform. Lets the platform
+  see infrastructure metadata and read CloudWatch logs. It cannot change
+  anything, read secret values, read S3 object contents or read database items.
+
+Parameters:
+  PlatformAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: AWS account ID of the engineering platform (we send this to you).
+  ExternalId:
+    Type: String
+    MinLength: 16
+    NoEcho: true
+    Description: Shared secret we generate per client, prevents confused-deputy misuse.
+  RoleName:
+    Type: String
+    Default: EngineeringPlatformReadOnly
+  MaxSessionHours:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 12
+
+Resources:
+  PlatformReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      MaxSessionDuration: !Ref MaxSessionHours
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${PlatformAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      ManagedPolicyArns:
+        # Lists and describes resources across services. No data-plane reads.
+        - arn:aws:iam::aws:policy/job-function/ViewOnlyAccess
+      Policies:
+        - PolicyName: ReadLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+        - PolicyName: DenySensitiveReads
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Belt and braces: explicit denies win over anything attached later.
+              - Effect: Deny
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                  - kms:Decrypt
+                  - s3:GetObject
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Description: Send this ARN back to us.
+    Value: !GetAtt PlatformReadOnlyRole.Arn

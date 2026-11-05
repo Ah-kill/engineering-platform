@@ -1,9 +1,39 @@
 # Engineering Platform: Phase 1 Architecture and Research
 
-Status: draft for review, 2026-11-04
+Status: revised 2026-11-05 after review (see section 0). Phase 1 Foundation is implemented.
 Scope: research, architecture, security model, tenancy, schema, roadmap, risks. No application code yet.
 
 Evidence note: the open-source review below is based on each project's LICENSE file, GitHub metadata and README, read on 2026-11-04. I did not audit source code. Every "reuse" claim is therefore a hypothesis to confirm in a time-boxed spike (see section 11), not a finding.
+
+---
+
+## 0. Decisions after review (2026-11-05)
+
+### 0.1 Your answers
+
+| Question | Answer | Effect on the design |
+|----------|--------|----------------------|
+| Who logs in? | Only our developers, with a login ID and password | Email/password auth (D9). Clients never log in, which also keeps the AGPL/BSL questions simpler because everything is internal use |
+| Client AWS access | Clients will share a role or maybe a service account; we tell them what we need | We ask for a cross-account IAM role with an ExternalId. See `docs/02-what-to-ask-clients.md`. Access keys only as a fallback, encrypted and rotated |
+| Team size | 2-3 developers | No Kubernetes, no Redis, no microservices. One machine for the control plane, one for workspaces (or one machine at first, see 0.3) |
+| Run locally first | Yes, deployment later | Runs with `npm install` and `npm run dev`. Embedded Postgres (PGlite), so nothing else to install |
+| Database | Prefer none, local Postgres if needed | A database is needed (users, permissions, sessions, audit must be consistent under concurrent use). Local = PGlite, which *is* Postgres; switch to a server with `DATABASE_URL` |
+
+### 0.2 Claude: subscription login vs API key
+
+You asked whether the platform can use Claude Code the way you use it in your local terminal (subscription login) instead of paying for an API key.
+
+- Technically yes. The workspace container can run the real Claude Code CLI, and each developer can sign in with their own subscription inside their own workspace. It behaves exactly like your local terminal.
+- The policy question is open. Anthropic's Agent SDK documentation says: "Unless previously approved, Anthropic does not allow third party developers to offer claude.ai login or rate limits for their products, including agents built on the Claude Agent SDK." We are building an internal tool for our own staff, not a product for others, so this may be acceptable, but that is Anthropic's call, not ours. Ask Anthropic (or check the Team/Enterprise plan terms) before relying on it.
+- Hard rule either way: **one subscription per developer, never shared**, and the login token is stored encrypted per user and only mounted into that user's own workspace.
+- Cost: a subscription is a flat monthly fee per developer; API usage is pay-per-token, so heavy daily use can cost more. With budgets per developer and per app (already in the design) the API cost is predictable. A sensible path is to start on API keys with a small budget, measure real usage for two weeks, then compare against subscription pricing.
+
+Design result (D6): the agent runner supports both modes; API key or Bedrock is the default, and subscription mode is a per-developer setting that stays disabled until confirmed.
+
+### 0.3 Hosting at this size
+
+For 2-3 developers, the simplest safe layout is two small machines: one runs the control plane (API, web, Postgres), the other runs workspace containers with gVisor and no credentials. Running both on one machine is acceptable for local development and a short pilot, but it means a container escape lands next to the database, so it should not hold real client credentials in that setup.
+
 
 ---
 
@@ -13,13 +43,13 @@ Evidence note: the open-source review below is based on each project's LICENSE f
 |---|----------|-----|
 | D1 | Build our own control plane. Reuse libraries and patterns, do not fork a platform. | No surveyed project has per-client AWS brokering, KMS-backed secrets, environment-scoped RBAC and audit. Two are AGPL and one is BSL, which constrains forking. |
 | D2 | Treat the **application** as the security boundary, not the organization. | We are one company serving many clients. The real threat is client A's data reaching client B or a developer who was never assigned. |
-| D3 | Modular monolith control plane (NestJS) plus a separate **execution worker** service. | Strict module boundaries now, extraction later. The worker is separate because it is the dangerous part. |
+| D3 | Modular monolith control plane (Fastify, one folder per module) plus a separate **execution worker** service. | Strict module boundaries now, extraction later. The worker is separate because it is the dangerous part. Fastify instead of NestJS: less framework for a 2-3 person team, simpler tests. |
 | D4 | The agent container never holds long-lived credentials. | Git tokens, AWS keys and the Anthropic key stay on the control plane or an egress proxy. The agent gets only short-lived, scoped, per-session grants. |
 | D5 | Drive Claude Code through the official **Claude Agent SDK** (fall back to the CLI in headless/stream-json mode). | Official, supported, streams tool events, supports permission callbacks and plan mode. |
-| D6 | Use an **Anthropic API key or Bedrock/Vertex**, not employees' personal Claude subscriptions. | A shared multi-user service on personal subscription logins is very likely outside Anthropic's terms. Confirm with Anthropic before launch. Bedrock fits the AWS-first design. |
+| D6 | The agent runner supports two auth modes per developer: **(a) the developer's own Claude subscription login** for the Claude Code CLI in their own workspace, and **(b) an Anthropic API key or Bedrock**. Mode (a) is off until Anthropic confirms it is allowed. Never one shared subscription. | Revised at your request (see 0.2). Anthropic's Agent SDK docs say third parties may not offer claude.ai login in products built on the SDK, so mode (b) is the default. |
 | D7 | MVP supports **GitHub only** and one AWS path (AssumeRole with ExternalId). Others sit behind adapter interfaces. | Six Git providers and every AWS auth variant at once is how this project stalls. |
 | D8 | Production AWS access is **read-only** in v1. Writes go through an explicit approval workflow in a later phase. | The spec's own risk list (prod deploys, IAM changes, deletes) is the largest blast radius. |
-| D9 | Authentication through OIDC (Cognito or Keycloak behind an interface). We do not store passwords. | MFA and SSO come for free and the audit story is simpler. |
+| D9 | Email and password login (Argon2id, httpOnly session cookie). TOTP MFA comes next. OIDC/SSO can be added later behind the same session layer. | Revised: only your own 2-3 developers log in, so an identity provider is not worth the setup yet. |
 | D10 | Support **creating new applications from scratch**, not only attaching existing repos. Creation is a template-driven, approval-gated flow (section 4.4). | Added at your request. Greenfield apps need repo creation, scaffolding and optionally cloud infrastructure, which are all higher-risk writes. |
 
 ---
@@ -207,13 +237,13 @@ Security notes specific to new apps:
 |------|--------|-----------------------------------|
 | Monorepo | pnpm workspaces + Turborepo | Shared types between API, worker and UI |
 | Language | TypeScript, `strict` | |
-| Backend | NestJS on Fastify | Structured modules map to our boundaries. Alternative: Hono/Fastify plain, less structure |
-| Frontend | Next.js (App Router), Tailwind, shadcn/ui | |
+| Backend | Fastify 5, zod validation | Implemented. One folder per module (`identity`, `tenancy`, `access`, `audit`) |
+| Frontend | Vite + React + React Router, plain CSS tokens | Implemented. A separate SPA talking to the API is simpler than Next.js for an internal tool; Monaco and xterm.js work the same |
 | Editor/terminal | Monaco, xterm.js, node-pty | Per the brief |
-| DB | PostgreSQL 16, Drizzle or Kysely, SQL migrations | Prefer a typed query builder over a heavy ORM so RLS and `SET LOCAL` stay explicit |
-| Queue/cache | Redis + BullMQ | Postgres-backed queue (graphile-worker) is a lower-ops alternative; choose in Phase 1 |
+| DB | PostgreSQL. Locally: **PGlite** (embedded Postgres in the Node process, no install). Server: any Postgres via `DATABASE_URL` | Implemented with plain parameterized SQL and numbered `.sql` migrations, so RLS and `SET LOCAL` stay explicit |
+| Queue/cache | None yet. A Postgres-backed queue (pg-boss or graphile-worker) when background jobs arrive | Dropped Redis: at 2-3 developers it is one more thing to run for no benefit |
 | Realtime | SSE for agent events, WebSocket for terminal | SSE is simpler to proxy and replay |
-| AuthN | OIDC (Cognito or Keycloak) | Interface so either works |
+| AuthN | Email/password + sessions; TOTP next; OIDC optional later | See D9 |
 | AuthZ | In-house policy module over a `grants` table | OpenFGA/Cedar considered; revisit if rules outgrow a table |
 | Sandbox | Rootless containers on gVisor or Sysbox, dedicated worker hosts | Firecracker later. Plain Docker is not a sufficient boundary for untrusted code |
 | Agent | Claude Agent SDK | CLI headless as fallback. Runner interface for Codex/OpenHands later |
