@@ -4,7 +4,7 @@ import { audit } from '../audit/audit.js';
 import { caller, type RouteDeps } from '../http/app.js';
 import { HttpError, mapDbError } from '../http/errors.js';
 import { principalOf } from '../identity/user-routes.js';
-import { requirePermission, requireVisible, type ResourceRef } from './authorize.js';
+import { authorize, requirePermission, type ResourceRef } from './authorize.js';
 import { ROLES } from './policy.js';
 
 const scopeType = z.enum(['client', 'application', 'environment']);
@@ -39,7 +39,10 @@ export async function grantRoutes(app: FastifyInstance, { db }: RouteDeps) {
     const { user } = caller(req);
     const { scopeType: type, scopeId } = listQuery.parse(req.query);
     return db.tenant(user.orgId, async (q) => {
-      await requireVisible(q, principalOf(user), { type, id: scopeId });
+      // Membership needs real view permission on the scope. Navigation-only visibility
+      // (holding a grant on something inside it) is not enough to list who else has access.
+      const { allowed } = await authorize(q, principalOf(user), `${type}.view`, { type, id: scopeId });
+      if (!allowed) throw HttpError.notFound();
       let sql: string;
       switch (type) {
         case 'client':
@@ -112,6 +115,10 @@ export async function grantRoutes(app: FastifyInstance, { db }: RouteDeps) {
       );
       if (!grant) throw HttpError.notFound();
       const chain = await requirePermission(q, principalOf(user), 'grant.manage', { type: grant.scope_type, id: grant.scope_id });
+      // Same rule as granting: only org admins control access to protected environments.
+      if (chain && 'protected' in chain && chain.protected && !user.isOrgAdmin) {
+        throw HttpError.forbidden('Only an org admin can change access to a protected environment');
+      }
       await q.query('DELETE FROM grants WHERE id = $1', [id]);
       await audit(q, {
         orgId: user.orgId, actorId: user.id, action: 'grant.revoked', resourceType: 'grant', resourceId: id,

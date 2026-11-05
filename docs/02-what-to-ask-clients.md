@@ -33,7 +33,8 @@ For GitLab, Bitbucket or CodeCommit: same idea, a scoped token or app with acces
 How the role works:
 - We give the client our **platform AWS account ID** and a unique **ExternalId** for them.
 - The role trusts only our account, and only with that ExternalId.
-- It is **read-only**: we can list and describe resources and read logs and metrics. It explicitly cannot read secret values, S3 object contents or database items, and cannot change anything.
+- It is **read-only**: we can list and describe resources and read logs and metrics. It explicitly cannot read secret values, S3 object contents or database items, and cannot change anything. It also cannot read Lambda or ECS configuration, because those return environment variables that often contain secrets.
+- The template is a **draft** until we have deployed it in a test account.
 - Sessions last at most 1 hour by default. The client can delete the role at any time to cut access instantly.
 
 Write access (deployments) comes later, as a separate role per environment, only after we agree on scope. Production writes will always require an approval inside our platform.

@@ -1,3 +1,4 @@
+# DRAFT: not yet deployed or tested in a real AWS account. Review before sending to a client.
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Read-only cross-account role for the engineering platform. Lets the platform
@@ -63,19 +64,35 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Belt and braces: explicit denies win over anything attached later.
+              # Explicit denies win over anything attached later.
+              # Lambda and ECS "describe" calls return environment variables, which often
+              # hold secrets, so they are denied too. Trade-off: this role cannot list Lambda
+              # functions or read task definitions. The AWS phase will replace ViewOnlyAccess
+              # with a curated allowlist that inspects them through a redacting broker.
               - Effect: Deny
                 Action:
                   - secretsmanager:GetSecretValue
+                  - secretsmanager:BatchGetSecretValue
                   - ssm:GetParameter
                   - ssm:GetParameters
                   - ssm:GetParametersByPath
+                  - ssm:GetParameterHistory
                   - kms:Decrypt
                   - s3:GetObject
+                  - s3:GetObjectVersion
                   - dynamodb:GetItem
                   - dynamodb:BatchGetItem
                   - dynamodb:Query
                   - dynamodb:Scan
+                  - dynamodb:PartiQLSelect
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListFunctions
+                  - lambda:ListVersionsByFunction
+                  - ecs:DescribeTaskDefinition
+                  - apprunner:DescribeService
+                  - elasticbeanstalk:DescribeConfigurationSettings
+                  - codebuild:BatchGetProjects
                 Resource: '*'
 
 Outputs:

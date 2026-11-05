@@ -167,6 +167,30 @@ describe('production guardrails for app admins', () => {
     const r = await admin.post('/api/grants', { userId: leadUserId, role: 'developer', scopeType: 'environment', scopeId: prodEnvId });
     expect(r.statusCode).toBe(201);
   });
+
+  it('app admin cannot revoke production access either', async () => {
+    const grants = (await admin.get(`/api/grants?scopeType=environment&scopeId=${prodEnvId}`)).json() as { id: string; scopeType: string }[];
+    const prodGrant = grants.find((g) => g.scopeType === 'environment')!;
+    expect((await lead.delete(`/api/grants/${prodGrant.id}`)).statusCode).toBe(403);
+  });
+});
+
+describe('membership visibility', () => {
+  it('a user with access to one environment cannot list who has access to the whole application', async () => {
+    await admin.post('/api/users', { email: 'envonly@acme.test', displayName: 'Env Only', password: PASSWORD });
+    const users = (await admin.get('/api/users')).json() as { id: string; email: string }[];
+    const envOnlyId = users.find((u) => u.email === 'envonly@acme.test')!.id;
+    await admin.post('/api/grants', { userId: envOnlyId, role: 'developer', scopeType: 'environment', scopeId: devEnvId });
+    const envOnly = await Client.login(env.app, 'envonly@acme.test');
+
+    // Can still navigate to the application...
+    expect((await envOnly.get(`/api/applications/${paymentsId}`)).statusCode).toBe(200);
+    // ...but cannot enumerate its members or the client's members.
+    expect((await envOnly.get(`/api/grants?scopeType=application&scopeId=${paymentsId}`)).statusCode).toBe(404);
+    expect((await envOnly.get(`/api/grants?scopeType=client&scopeId=${clientId}`)).statusCode).toBe(404);
+    // Members of their own environment are fine.
+    expect((await envOnly.get(`/api/grants?scopeType=environment&scopeId=${devEnvId}`)).statusCode).toBe(200);
+  });
 });
 
 describe('organization isolation', () => {

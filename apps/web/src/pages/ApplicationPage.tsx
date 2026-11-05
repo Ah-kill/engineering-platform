@@ -68,13 +68,15 @@ export function ApplicationPage() {
         </p>
       </div>
 
-      <Members
-        scopeType="application"
-        scopeId={a.id}
-        canManage={perms.includes('grant.manage')}
-        environments={a.environments}
-        isOrgAdmin={me?.user.isOrgAdmin}
-      />
+      {perms.includes('application.view') && (
+        <Members
+          scopeType="application"
+          scopeId={a.id}
+          canManage={perms.includes('grant.manage')}
+          environments={a.environments}
+          isOrgAdmin={me?.user.isOrgAdmin}
+        />
+      )}
     </div>
   );
 }
