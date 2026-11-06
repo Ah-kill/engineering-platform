@@ -145,6 +145,9 @@ infra/              templates we send to clients (read-only AWS role)
   hooks from the repository, and works through a tool policy: no push, no git config, no credential
   reads, file tools limited to the checkout, risky commands need approval. Known secrets are redacted
   from anything stored or streamed.
+- Commands that carry your GitHub token (fetch, pull, push) run only while Claude is idle, only after the
+  workspace's `.git/config` passes an allowlist check, with settings that can run programs, proxy traffic
+  or skip TLS checks forced off, and without submodules.
 - **Current limit:** workspaces run as ordinary processes on the host. The tool policy is a guardrail,
   not a sandbox: a determined prompt injection could still run a shell command that reads files the
   server user can read. Until the container runtime lands, use it with repositories you trust and do not
