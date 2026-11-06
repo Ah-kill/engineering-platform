@@ -11,6 +11,17 @@
     "create-admin": "npm run create-admin --workspace apps/api --",
     "test": "npm test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "build": "npm run build --workspaces --if-present"
+    "build": "npm run build --workspaces --if-present",
+    "update:claude": "npm install @anthropic-ai/claude-agent-sdk@latest --workspace apps/api && npm test --workspace apps/api",
+    "test:e2e": "playwright test",
+    "test:e2e:report": "playwright show-report e2e-report"
+  },
+  "overrides": {
+    "monaco-editor": {
+      "dompurify": "3.4.17"
+    }
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0"
   }
 }

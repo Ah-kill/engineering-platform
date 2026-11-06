@@ -4,6 +4,13 @@ import { openPglite, type Database } from '../src/db/db.js';
 import { migrate } from '../src/db/migrate.js';
 import { buildApp } from '../src/http/app.js';
 import { hashPassword } from '../src/identity/passwords.js';
+import { Vault } from '../src/vault/vault.js';
+import type { RemoteResolver } from '../src/workspaces/service.js';
+import type { AgentDriver } from '../src/agents/driver.js';
+import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 export const WEB_ORIGIN = 'http://localhost:5173';
 export const PASSWORD = 'correct-horse-battery';
@@ -11,15 +18,27 @@ export const PASSWORD = 'correct-horse-battery';
 export interface TestEnv {
   app: FastifyInstance;
   db: Database;
+  workspacesDir: string;
   close(): Promise<void>;
 }
 
-export async function setup(): Promise<TestEnv> {
+export async function setup(opts: { remoteFor?: RemoteResolver; agentDriver?: AgentDriver } = {}): Promise<TestEnv> {
   const db = await openPglite();
   await migrate(db);
   const config = loadConfig({ WEB_ORIGIN, LOG_LEVEL: 'silent' });
-  const app = await buildApp({ config, db });
-  return { app, db, close: async () => { await app.close(); await db.close(); } };
+  const workspacesDir = await mkdtemp(path.join(os.tmpdir(), 'ep-ws-'));
+  const vault = Vault.fromKey(randomBytes(32).toString('base64'));
+  const app = await buildApp({ config, db, vault, workspacesDir, ...opts });
+  return {
+    app,
+    db,
+    workspacesDir,
+    close: async () => {
+      await app.close();
+      await db.close();
+      await rm(workspacesDir, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+    },
+  };
 }
 
 let passwordHash: Promise<string> | undefined;

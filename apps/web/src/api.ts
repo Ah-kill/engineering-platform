@@ -9,7 +9,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
+export async function api<T>(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method,
     credentials: 'same-origin',
@@ -76,6 +76,39 @@ export interface UserRow {
   id: string; email: string; displayName: string; isOrgAdmin: boolean;
   status: 'active' | 'disabled'; createdAt: string; lastLoginAt: string | null;
 }
+
+export type CredentialKind = 'anthropic_api_key' | 'claude_oauth_token' | 'github_token';
+
+export interface AgentSettings {
+  authMode: 'api_key' | 'subscription';
+  defaultModel: string;
+  credentials: Record<CredentialKind, { saved: boolean; hint?: string; updatedAt?: string }>;
+}
+
+export interface ModelOption {
+  id: string; label: string; description: string; resolvedModel?: string; source: 'claude-code' | 'anthropic-api';
+}
+
+export interface Repository { id: string; owner: string; name: string; defaultBranch: string; url: string }
+
+export interface Workspace {
+  id: string; applicationId: string; environmentId: string; branch: string; baseBranch: string;
+  state: 'creating' | 'ready' | 'failed' | 'deleted'; error: string | null; createdAt: string; lastActiveAt: string;
+  repoOwner: string; repoName: string; defaultBranch: string; applicationName: string; clientId: string;
+  clientName: string; environmentName: string; environmentKind: string;
+}
+
+export interface TreeEntry { path: string; type: 'file' | 'dir'; skipped?: boolean }
+
+export interface GitFile { path: string; code: string; status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked' }
+export interface GitStatus { branch: string; ahead: number; behind: number; files: GitFile[]; baseBranch: string; defaultBranch: string }
+
+export interface AgentSession {
+  id: string; title: string; model: string; authMode: string; costUsd: number;
+  inputTokens: number; outputTokens: number; createdAt: string; updatedAt: string;
+}
+
+export interface AgentEventRow { id: string; sessionId?: string; kind: string; data: Record<string, any>; createdAt: string }
 
 export interface AuditRow {
   id: string; occurredAt: string; action: string; outcome: string; actorEmail: string | null;

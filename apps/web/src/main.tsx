@@ -1,6 +1,6 @@
-import { StrictMode } from 'react';
+import { lazy, StrictMode, Suspense } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth';
 import { Layout } from './components/Layout';
 import { LoginPage } from './pages/LoginPage';
@@ -10,7 +10,13 @@ import { ApplicationPage } from './pages/ApplicationPage';
 import { UsersPage } from './pages/UsersPage';
 import { AuditPage } from './pages/AuditPage';
 import { AccountPage } from './pages/AccountPage';
+import { SettingsPage } from './pages/SettingsPage';
+import { HomePage } from './pages/HomePage';
+
+// The IDE pulls in Monaco (large); load it only when a workspace is opened.
+const WorkspacePage = lazy(() => import('./pages/WorkspacePage'));
 import './styles.css';
+import './ide.css';
 
 function App() {
   const { me, loading } = useAuth();
@@ -18,14 +24,16 @@ function App() {
   if (!me) return <LoginPage />;
   return (
     <Routes>
+      <Route path="/workspaces/:id" element={<Suspense fallback={<div className="center muted">Loading editor…</div>}><WorkspacePage /></Suspense>} />
       <Route element={<Layout />}>
-        <Route path="/" element={<Navigate to="/clients" replace />} />
+        <Route path="/" element={<HomePage />} />
         <Route path="/clients" element={<ClientsPage />} />
         <Route path="/clients/:id" element={<ClientPage />} />
         <Route path="/applications/:id" element={<ApplicationPage />} />
         <Route path="/users" element={<UsersPage />} />
         <Route path="/audit" element={<AuditPage />} />
         <Route path="/account" element={<AccountPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<p className="muted">Page not found.</p>} />
       </Route>
     </Routes>

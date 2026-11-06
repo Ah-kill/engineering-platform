@@ -1,17 +1,31 @@
 # Engineering Platform
 
-Internal platform for managing client applications and working on them with Claude.
-Developers sign in, pick a client, application and environment, and (in later phases)
-open an isolated workspace with Claude Code, Git and scoped AWS access.
+Internal platform for managing client applications and working on them with Claude Code.
+Developers sign in, pick a client, application and environment, open a workspace on a
+branch, and work with Claude in a browser IDE: plan, execute, review the diff, commit,
+push and open a pull request. Works on desktop and on a phone.
 
-**Status:** Phase 1 (Foundation) is built: sign-in, clients, applications, environments,
-per-application access control, and the audit log. Git, workspaces, Claude, AWS and secrets
-are next. See [docs/01-architecture-and-research.md](docs/01-architecture-and-research.md).
+See [docs/01-architecture-and-research.md](docs/01-architecture-and-research.md) for the
+design and [docs/02-what-to-ask-clients.md](docs/02-what-to-ask-clients.md) for client onboarding.
+
+## Status
+
+| Area | State |
+|------|-------|
+| Sign-in, clients, applications, environments, developers, access control, audit | Built |
+| Per-developer Claude credentials (API key or subscription token), live model list | Built |
+| GitHub repositories, workspaces, editor, diff, commit, push, pull, branches, pull requests | Built |
+| Claude Code in the workspace: plan / execute, streaming, approvals, stop, history, cost | Built |
+| Phone layout | Built |
+| Home: continue where you left off; delete conversations and workspaces | Built |
+| Container isolation for workspaces (Docker) | **Next.** Workspaces currently run as local processes (see Security) |
+| Per-environment secrets and third-party API keys (Twilio, Okta, ...) | **Next** |
+| AWS account access broker | Planned |
+| Web terminal | Planned |
 
 ## Run it locally
 
-Requirements: Node.js 22 or newer. Nothing else: the database is embedded Postgres
-(PGlite) stored in `apps/api/.data/`.
+Requirements: Node.js 22 or newer and git. The database is embedded Postgres unless you set `DATABASE_URL`.
 
 ```bash
 npm install
@@ -26,18 +40,21 @@ npm run dev
 
 Open http://localhost:5173 and sign in.
 
-To use a real Postgres server instead of the embedded one, copy `apps/api/.env.example`
-to `apps/api/.env` and set `DATABASE_URL`
-(for example `postgres://platform:pass@localhost:5432/engineering_platform`).
-`.env` is git-ignored. Migrations run automatically at startup. The database user needs
-`CREATEROLE` the first time, because the schema creates the restricted `platform_app` role.
+To use a Postgres server, copy `apps/api/.env.example` to `apps/api/.env` and set `DATABASE_URL`
+(for example `postgres://platform:pass@localhost:5432/engineering_platform`). `.env` is git-ignored.
+Migrations run automatically at startup. The database user needs `CREATEROLE` the first time,
+because the schema creates the restricted `platform_app` role.
 
-### Settings (environment variables, all optional)
+### Settings (environment variables in `apps/api/.env`, all optional)
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `DATABASE_URL` | unset | Postgres connection string. Unset = embedded PGlite |
-| `DATA_DIR` | `.data/pg` | Where embedded Postgres keeps its files (relative to `apps/api`) |
+| `DATABASE_URL` | unset | Postgres connection string. Unset = embedded PGlite in `DATA_DIR` |
+| `DATA_DIR` | `.data/pg` | Embedded Postgres files (relative to `apps/api`) |
+| `VAULT_KEY` | unset | Base64 32-byte key that encrypts saved credentials. Unset = generated into `VAULT_KEY_FILE` |
+| `VAULT_KEY_FILE` | `.data/vault.key` | **Back this file up.** Saved keys and tokens cannot be decrypted without it |
+| `WORKSPACES_DIR` | `~/.engineering-platform/workspaces` | Where workspace checkouts live |
+| `AGENT_MAX_TURNS` / `AGENT_MAX_BUDGET_USD` | `80` / `10` | Limits per Claude run |
 | `PORT` / `HOST` | `4000` / `127.0.0.1` | API listen address; local-only by default |
 | `WEB_ORIGIN` | `http://localhost:5173` | The only origin allowed to make changes |
 | `SESSION_TTL_HOURS` | `12` | Sign-in lifetime |
@@ -45,51 +62,92 @@ to `apps/api/.env` and set `DATABASE_URL`
 
 ## Using it
 
-1. **Clients:** as an org admin, create a client (for example "ABC Technologies").
-2. **Applications:** inside the client, create an application. Choose "Existing repository"
-   or "Build a new app from scratch". Development, staging and production environments
-   are created for you; production is protected.
-3. **Developers:** add developers under *Developers*. They start with **no access**.
-4. **Access:** on a client or application page, grant a developer a role:
-   - *Viewer*: can see it.
-   - *Developer*: can work in its environments (except protected ones).
-   - *App admin*: can also edit the app, its environments and who has access.
-   - *App creator* (client only): can create new applications under that client.
-5. **Production:** working access to a protected environment needs a grant on that exact
-   environment, and only an org admin can give it.
-6. **Audit log:** every change and sign-in is recorded (admins only).
+1. **Clients and applications:** as an org admin, create a client, then an application
+   ("Existing repository" or "Build a new app from scratch"). Development, staging and
+   production environments are created; production is protected.
+2. **Developers and access:** add developers under *Developers* (they start with no access),
+   then grant roles on a client or application: *Viewer*, *Developer*, *App admin*, *App creator*.
+   Working access to a protected environment needs a grant on that exact environment, given by an org admin.
+3. **Claude & GitHub** (each developer, once):
+   - *API key*: paste a key from platform.claude.com. Billed per use.
+   - *Claude subscription*: run `claude setup-token` on your own computer. It opens the same
+     sign-in page as `/login` and prints a token valid for a year; paste it. Confirm with
+     Anthropic that this use is allowed for your plan.
+   - *Default model*: the list comes live from Claude Code and your account, so new models appear
+     automatically. "Default", "Opus", "Sonnet" and "Haiku" always mean the newest version.
+   - *GitHub token*: a fine-grained token limited to the client repositories, with
+     Contents and Pull requests read/write.
+4. **Repository:** an app admin connects the GitHub repository on the application page.
+5. **Workspace:** *New workspace* → pick an environment and a branch → the IDE opens.
+6. **With Claude:** describe the change in **Plan** mode, read the plan, press
+   **Approve and execute**. Risky commands (deletes, cloud CLIs, `docker`, ...) wait for your
+   approval; pushing and reading credentials are always blocked. Then review in **Changes**,
+   commit, push and open a pull request. Pushing to the default branch is refused.
 
-Org admins manage everything but do not automatically get working access to any
-environment; they grant it to themselves explicitly, and that is audited.
+### Keeping Claude Code and models up to date
+
+Claude Code is bundled in `@anthropic-ai/claude-agent-sdk`. *Claude & GitHub* shows the installed
+version and whether a newer one exists. To update (also brings support for newly released models):
+
+```bash
+npm run update:claude   # installs the latest SDK and runs the API tests
+```
+
+The update is applied deliberately rather than automatically, so a breaking change never lands in
+the middle of someone's session. New models usually work before an update anyway: aliases resolve to
+the newest model, and API-key users also see every model id from Anthropic's Models API.
 
 ## Develop
 
 ```bash
-npm test            # API unit + integration tests (embedded Postgres, no setup)
-npm run typecheck   # both apps
+npm test            # API unit + integration tests (embedded Postgres, local git, no network)
+npm run test:e2e    # Playwright browser tests, desktop and phone (isolated stack on ports 4100/5273)
+SCREENSHOTS=shots npx playwright test   # also saves screenshots of key screens to ./shots
+npm run typecheck
 npm run build
 ```
 
-Layout:
+The Playwright stack (`apps/api/e2e/server.ts`) runs the real API and web app with a fresh database,
+a local git repository in place of GitHub, and a scripted agent in place of Claude, so it needs no
+credentials and costs nothing.
 
 ```
-apps/api      Fastify API
-  migrations/   numbered SQL migrations (schema, row-level security, grants)
-  src/access    authorization policy (pure) + database-backed checks
-  src/identity  passwords, sessions, users
-  src/tenancy   clients, applications, environments
-  src/audit     append-only audit log
-  test/         policy unit tests and HTTP integration tests
-apps/web      React app (Vite)
-docs/         architecture, research, client onboarding checklist
-infra/        templates we send to clients (read-only AWS role)
+apps/api            Fastify API
+  migrations/         numbered SQL migrations (schema, row-level security, grants)
+  src/access          authorization policy + checks
+  src/identity        passwords, sessions, users
+  src/tenancy         clients, applications, environments
+  src/settings        per-user Claude/GitHub credentials and model settings
+  src/vault           credential encryption
+  src/git             git CLI wrapper, GitHub API
+  src/workspaces      workspace lifecycle, files, git routes
+  src/agents          Claude Agent SDK driver, tool policy, run manager, models, version
+  src/audit           append-only audit log
+  test/               unit and integration tests
+  e2e/                isolated server for Playwright
+apps/web            React app (Vite), Monaco editor
+e2e/                Playwright tests
+docs/               architecture, research, client onboarding
+infra/              templates we send to clients (read-only AWS role)
 ```
 
-## Security model in one paragraph
+## Security
 
-Every request is authorized in the API with a single policy function; the UI only hides
-buttons. All queries run as an unprivileged database role with row-level security on the
-organization, so a missing filter cannot leak another organization's data. Passwords use
-Argon2id; sessions are random tokens stored only as hashes in httpOnly SameSite=Strict
-cookies; state-changing requests also need a custom header and the allowed Origin (CSRF).
-Login is rate-limited. The audit table is insert-only for the application role.
+- Every request is authorized in the API with one policy function; the UI only hides buttons.
+  Queries run as an unprivileged database role with row-level security on the organization.
+- Passwords use Argon2id. Sessions are random tokens stored as hashes in httpOnly, SameSite=Strict
+  cookies; changes also need a custom header and the allowed Origin. Login is rate-limited.
+- Credentials (Anthropic keys, subscription tokens, GitHub tokens) are encrypted with AES-256-GCM
+  and only ever shown as their last four characters. Git tokens are passed to git per command,
+  never written to disk or remote URLs.
+- Claude runs with its own HOME and config folder per workspace, receives only the developer's own
+  credential and a minimal environment (no database URL or platform keys), does not load settings or
+  hooks from the repository, and works through a tool policy: no push, no git config, no credential
+  reads, file tools limited to the checkout, risky commands need approval. Known secrets are redacted
+  from anything stored or streamed.
+- **Current limit:** workspaces run as ordinary processes on the host. The tool policy is a guardrail,
+  not a sandbox: a determined prompt injection could still run a shell command that reads files the
+  server user can read. Until the container runtime lands, use it with repositories you trust and do not
+  expose the server to the internet. Every workspace action is audited.
+- The editor bundles Monaco, which ships its own copy of DOMPurify 3.4.15. The advisories against that
+  version concern `IN_PLACE`, `SAFE_FOR_TEMPLATES` and XHTML parsing, none of which Monaco uses.

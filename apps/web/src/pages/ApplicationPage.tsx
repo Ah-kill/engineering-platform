@@ -4,12 +4,15 @@ import { api, type ApplicationDetail, type EnvironmentRow } from '../api';
 import { useAuth } from '../auth';
 import { useAction, useResource } from '../hooks';
 import { Members } from '../components/Members';
+import { RepositoryCard, WorkspacesCard } from '../components/RepoAndWorkspaces';
+import type { Repository } from '../api';
 
 export function ApplicationPage() {
   const { id } = useParams<{ id: string }>();
   const { me } = useAuth();
   const app = useResource<ApplicationDetail>(`/applications/${id}`);
   const [addingEnv, setAddingEnv] = useState(false);
+  const [repo, setRepo] = useState<Repository | null>(null);
 
   const archive = useAction(async () => {
     await api('POST', `/applications/${id}/${app.data?.archivedAt ? 'unarchive' : 'archive'}`);
@@ -61,12 +64,8 @@ export function ApplicationPage() {
         )}
       </div>
 
-      <div className="card">
-        <h2>Coming next</h2>
-        <p className="muted" style={{ margin: 0 }}>
-          Repository connection, AWS account and secrets, and the AI workspace attach to this application in the next phases.
-        </p>
-      </div>
+      <RepositoryCard appId={a.id} canEdit={perms.includes('application.update')} onChange={setRepo} />
+      <WorkspacesCard appId={a.id} repo={repo} environments={a.environments} />
 
       {perms.includes('application.view') && (
         <Members

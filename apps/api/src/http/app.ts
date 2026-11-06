@@ -11,6 +11,13 @@ import { userRoutes } from '../identity/user-routes.js';
 import { tenancyRoutes } from '../tenancy/routes.js';
 import { grantRoutes } from '../access/routes.js';
 import { auditRoutes } from '../audit/routes.js';
+import { settingsRoutes } from '../settings/routes.js';
+import { workspaceRoutes } from '../workspaces/routes.js';
+import { agentRoutes } from '../agents/routes.js';
+import { AgentManager } from '../agents/manager.js';
+import { ClaudeSdkDriver, type AgentDriver } from '../agents/driver.js';
+import { githubRemote, type RemoteResolver } from '../workspaces/service.js';
+import type { Vault } from '../vault/vault.js';
 import { HttpError } from './errors.js';
 
 export const SESSION_COOKIE = 'ep_session';
@@ -29,20 +36,28 @@ declare module 'fastify' {
 export interface AppDeps {
   config: Config;
   db: Database;
+  vault: Vault;
+  workspacesDir: string;
+  /** Where workspaces clone from. Defaults to GitHub; tests use local repositories. */
+  remoteFor?: RemoteResolver;
+  /** The agent implementation. Defaults to Claude Code via the Agent SDK. */
+  agentDriver?: AgentDriver;
 }
 
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
-export async function buildApp({ config, db }: AppDeps): Promise<FastifyInstance> {
+export async function buildApp(appDeps: AppDeps): Promise<FastifyInstance> {
+  const { config, db } = appDeps;
   const app = Fastify({
     logger: {
       level: config.LOG_LEVEL,
       redact: ['req.headers.cookie', 'req.headers.authorization', 'res.headers["set-cookie"]'],
     },
     trustProxy: false,
-    bodyLimit: 256 * 1024,
+    bodyLimit: 6 * 1024 * 1024,
   });
 
+  // File saves from the editor can be large; other routes stay small via per-route validation.
   // Only JSON bodies are accepted.
   app.removeContentTypeParser('text/plain');
 
@@ -85,13 +100,20 @@ export async function buildApp({ config, db }: AppDeps): Promise<FastifyInstance
 
   app.get('/api/health', { config: { public: true } }, async () => ({ ok: true }));
 
-  const deps = { config, db };
+  const agents = new AgentManager(db, appDeps.agentDriver ?? new ClaudeSdkDriver(), {
+    maxTurns: config.AGENT_MAX_TURNS,
+    maxBudgetUsd: config.AGENT_MAX_BUDGET_USD,
+  });
+  const deps: RouteDeps = { ...appDeps, remoteFor: appDeps.remoteFor ?? githubRemote, agents };
   await app.register(async (api) => {
     await identityRoutes(api, deps);
     await userRoutes(api, deps);
     await tenancyRoutes(api, deps);
     await grantRoutes(api, deps);
     await auditRoutes(api, deps);
+    await settingsRoutes(api, deps);
+    await workspaceRoutes(api, deps);
+    await agentRoutes(api, deps);
   }, { prefix: '/api' });
 
   return app;
@@ -103,4 +125,4 @@ export function caller(req: FastifyRequest): AuthContext {
   return req.auth;
 }
 
-export type RouteDeps = AppDeps;
+export type RouteDeps = AppDeps & { remoteFor: RemoteResolver; agents: AgentManager };

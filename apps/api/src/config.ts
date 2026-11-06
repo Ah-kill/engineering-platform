@@ -14,6 +14,13 @@ const schema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  /** Master key for encrypting saved credentials (base64, 32 bytes). Unset = generated into VAULT_KEY_FILE. */
+  VAULT_KEY: z.string().optional(),
+  VAULT_KEY_FILE: z.string().default('.data/vault.key'),
+  /** Where workspace checkouts live. Default is outside the project folder. */
+  WORKSPACES_DIR: z.string().optional(),
+  AGENT_MAX_TURNS: z.coerce.number().int().positive().default(80),
+  AGENT_MAX_BUDGET_USD: z.coerce.number().positive().default(10),
 });
 
 export type Config = z.infer<typeof schema>;
