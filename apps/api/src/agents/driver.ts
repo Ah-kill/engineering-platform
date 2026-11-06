@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { query, type CanUseTool, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type CanUseTool, type SDKMessage, type SpawnedProcess, type SpawnOptions } from '@anthropic-ai/claude-agent-sdk';
 
 /**
  * Runs Claude Code through the official Claude Agent SDK. The SDK ships its own
@@ -29,6 +29,8 @@ export interface AgentRunInput {
   appendSystemPrompt: string;
   maxTurns: number;
   maxBudgetUsd: number;
+  /** Runs Claude Code somewhere other than the host (the workspace container). */
+  spawnClaudeCodeProcess?: (options: SpawnOptions) => SpawnedProcess;
 }
 
 export interface AgentDriver {
@@ -132,6 +134,7 @@ export class ClaudeSdkDriver implements AgentDriver {
         systemPrompt: { type: 'preset', preset: 'claude_code', append: input.appendSystemPrompt },
         maxTurns: input.maxTurns,
         maxBudgetUsd: input.maxBudgetUsd,
+        ...(input.spawnClaudeCodeProcess ? { spawnClaudeCodeProcess: input.spawnClaudeCodeProcess } : {}),
       },
     });
     for await (const msg of q) {

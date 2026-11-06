@@ -35,7 +35,7 @@ const prBody = z.object({ title: z.string().trim().min(1).max(250), body: z.stri
 const PROTECTED_BRANCHES = new Set(['main', 'master', 'production', 'prod', 'release']);
 
 export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
-  const { db, vault, workspacesDir, remoteFor } = deps;
+  const { db, vault, workspacesDir, remoteFor, runtime } = deps;
 
   // ---- repository connection ---------------------------------------------
 
@@ -139,6 +139,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
       branch: body.branch,
       baseBranch: prepared.baseBranch,
       createBranch: body.createBranch,
+      runtime,
     });
     return reply.status(202).send({ id: prepared.workspaceId, state: 'creating' });
   });
@@ -165,7 +166,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
       });
     });
     deps.agents.cancel(id);
-    await destroyWorkspaceFiles(workspacesDir, id).catch(() => undefined);
+    await destroyWorkspaceFiles(workspacesDir, id, runtime).catch(() => undefined);
     return { ok: true };
   });
 

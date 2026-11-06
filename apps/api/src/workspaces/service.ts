@@ -9,6 +9,7 @@ import { assertBranch, runGit } from '../git/git.js';
 import { readCredential } from '../settings/credentials.js';
 import type { Vault } from '../vault/vault.js';
 import { workspacePaths } from './paths.js';
+import { separateGitDir, type WorkspaceRuntime } from './runtime.js';
 
 export interface WorkspaceRow {
   id: string;
@@ -94,13 +95,16 @@ export async function provisionWorkspace(
     branch: string;
     baseBranch: string;
     createBranch: boolean;
+    runtime: WorkspaceRuntime;
   },
 ): Promise<void> {
   const paths = workspacePaths(opts.workspacesDir, opts.workspaceId);
   try {
     await mkdir(paths.root, { recursive: true });
     await mkdir(paths.home, { recursive: true });
-    await runGit(['clone', '--no-tags', '--origin', 'origin', opts.remote, paths.repo], {
+    // The git directory lives beside the checkout so the container can mount it read-only:
+    // Claude can read history and diffs but cannot change git configuration or hooks.
+    await runGit(['clone', '--no-tags', '--origin', 'origin', '--separate-git-dir', paths.gitDir, opts.remote, paths.repo], {
       cwd: paths.root,
       token: opts.token,
       timeoutMs: 10 * 60_000,
@@ -111,8 +115,11 @@ export async function provisionWorkspace(
     } else {
       await runGit(['checkout', assertBranch(opts.branch)], { cwd: paths.repo });
     }
+    await separateGitDir(paths);
+    await opts.runtime.ensure(paths);
     await db.tenant(opts.orgId, (q) => q.query(`UPDATE workspaces SET state = 'ready', error = NULL WHERE id = $1`, [opts.workspaceId]));
   } catch (err) {
+    await opts.runtime.remove(opts.workspaceId).catch(() => undefined);
     await rm(paths.root, { recursive: true, force: true }).catch(() => undefined);
     await db.tenant(opts.orgId, (q) =>
       q.query(`UPDATE workspaces SET state = 'failed', error = $2 WHERE id = $1`, [opts.workspaceId, String((err as Error).message).slice(0, 1000)]),
@@ -120,6 +127,7 @@ export async function provisionWorkspace(
   }
 }
 
-export async function destroyWorkspaceFiles(workspacesDir: string, workspaceId: string) {
+export async function destroyWorkspaceFiles(workspacesDir: string, workspaceId: string, runtime: WorkspaceRuntime) {
+  await runtime.remove(workspaceId);
   await rm(workspacePaths(workspacesDir, workspaceId).root, { recursive: true, force: true, maxRetries: 3 });
 }

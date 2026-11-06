@@ -131,6 +131,7 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
         workspaceId: id,
         repoDir: paths.repo,
         homeDir: paths.home,
+        dirs: paths,
         clientId: ctx.ws.clientId,
         applicationId: ctx.ws.applicationId,
         environmentId: ctx.ws.environmentId,

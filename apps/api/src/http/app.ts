@@ -18,6 +18,7 @@ import { AgentManager } from '../agents/manager.js';
 import { ClaudeSdkDriver, type AgentDriver } from '../agents/driver.js';
 import { githubRemote, type RemoteResolver } from '../workspaces/service.js';
 import type { Vault } from '../vault/vault.js';
+import { localRuntime, type WorkspaceRuntime } from '../workspaces/runtime.js';
 import { HttpError } from './errors.js';
 
 export const SESSION_COOKIE = 'ep_session';
@@ -42,6 +43,8 @@ export interface AppDeps {
   remoteFor?: RemoteResolver;
   /** The agent implementation. Defaults to Claude Code via the Agent SDK. */
   agentDriver?: AgentDriver;
+  /** Where Claude runs. main.ts passes Docker; omitted (tests) means local. */
+  runtime?: WorkspaceRuntime;
 }
 
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -100,11 +103,12 @@ export async function buildApp(appDeps: AppDeps): Promise<FastifyInstance> {
 
   app.get('/api/health', { config: { public: true } }, async () => ({ ok: true }));
 
-  const agents = new AgentManager(db, appDeps.agentDriver ?? new ClaudeSdkDriver(), {
+  const runtime = appDeps.runtime ?? localRuntime;
+  const agents = new AgentManager(db, appDeps.agentDriver ?? new ClaudeSdkDriver(), runtime, {
     maxTurns: config.AGENT_MAX_TURNS,
     maxBudgetUsd: config.AGENT_MAX_BUDGET_USD,
   });
-  const deps: RouteDeps = { ...appDeps, remoteFor: appDeps.remoteFor ?? githubRemote, agents };
+  const deps: RouteDeps = { ...appDeps, remoteFor: appDeps.remoteFor ?? githubRemote, agents, runtime };
   await app.register(async (api) => {
     await identityRoutes(api, deps);
     await userRoutes(api, deps);
@@ -125,4 +129,4 @@ export function caller(req: FastifyRequest): AuthContext {
   return req.auth;
 }
 
-export type RouteDeps = AppDeps & { remoteFor: RemoteResolver; agents: AgentManager };
+export type RouteDeps = AppDeps & { remoteFor: RemoteResolver; agents: AgentManager; runtime: WorkspaceRuntime };

@@ -82,6 +82,8 @@ export async function listTree(repoRoot: string): Promise<{ entries: TreeEntry[]
         return;
       }
       const rel = prefix ? `${prefix}/${item.name}` : item.name;
+      // .git is a directory in plain clones and a "gitdir:" file in platform workspaces.
+      if (item.name === '.git') continue;
       if (item.isSymbolicLink()) {
         entries.push({ path: rel, type: 'file' });
       } else if (item.isDirectory()) {

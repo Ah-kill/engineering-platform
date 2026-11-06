@@ -6,6 +6,8 @@ import { openDatabase } from './db/db.js';
 import { migrate } from './db/migrate.js';
 import { buildApp } from './http/app.js';
 import { Vault } from './vault/vault.js';
+import { readSdkPackage } from './agents/version.js';
+import { DockerRuntime, localRuntime, type WorkspaceRuntime } from './workspaces/runtime.js';
 
 const config = loadConfig();
 if (!config.DATABASE_URL) await mkdir(config.DATA_DIR, { recursive: true });
@@ -21,8 +23,29 @@ const { vault, created: vaultCreated } = config.VAULT_KEY
 const workspacesDir = path.resolve(config.WORKSPACES_DIR ?? path.join(os.homedir(), '.engineering-platform', 'workspaces'));
 await mkdir(workspacesDir, { recursive: true });
 
-const app = await buildApp({ config, db, vault, workspacesDir });
+// Claude Code runs in a container per workspace. The image is tagged with the Claude Code
+// version bundled in the SDK, so `npm run update:claude` also produces a fresh image.
+let runtime: WorkspaceRuntime = localRuntime;
+if (config.WORKSPACE_RUNTIME === 'docker') {
+  const sdk = await readSdkPackage();
+  const claudeCodeVersion = sdk.claudeCodeVersion ?? 'latest';
+  runtime = new DockerRuntime({
+    image: config.WORKSPACE_IMAGE ?? `engineering-platform-workspace:${claudeCodeVersion}`,
+    claudeCodeVersion,
+    cpus: config.WORKSPACE_CPUS,
+    memory: config.WORKSPACE_MEMORY,
+    pidsLimit: config.WORKSPACE_PIDS,
+  });
+}
+
+const app = await buildApp({ config, db, vault, workspacesDir, runtime });
 if (applied.length) app.log.info({ applied }, 'applied migrations');
+if (runtime.kind === 'docker') {
+  if (await DockerRuntime.available()) app.log.info('workspaces run in Docker containers');
+  else app.log.warn('Docker is not running: workspaces cannot be opened until Docker Desktop is started');
+} else {
+  app.log.warn('WORKSPACE_RUNTIME=local: Claude runs directly on this machine without isolation');
+}
 if (vaultCreated) app.log.warn(`generated a new credential encryption key at ${config.VAULT_KEY_FILE}; back it up, saved credentials cannot be decrypted without it`);
 app.log.info(config.DATABASE_URL ? 'using Postgres from DATABASE_URL' : `using embedded Postgres in ${config.DATA_DIR}`);
 app.log.info(`workspaces in ${workspacesDir}`);

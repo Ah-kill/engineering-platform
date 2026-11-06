@@ -19,6 +19,12 @@ const schema = z.object({
   VAULT_KEY_FILE: z.string().default('.data/vault.key'),
   /** Where workspace checkouts live. Default is outside the project folder. */
   WORKSPACES_DIR: z.string().optional(),
+  /** docker (default): Claude Code runs in a container per workspace. local: on the host (tests only). */
+  WORKSPACE_RUNTIME: z.enum(['docker', 'local']).default('docker'),
+  WORKSPACE_IMAGE: z.string().optional(),
+  WORKSPACE_CPUS: z.string().default('2'),
+  WORKSPACE_MEMORY: z.string().default('4g'),
+  WORKSPACE_PIDS: z.coerce.number().int().positive().default(512),
   AGENT_MAX_TURNS: z.coerce.number().int().positive().default(80),
   AGENT_MAX_BUDGET_USD: z.coerce.number().positive().default(10),
 });

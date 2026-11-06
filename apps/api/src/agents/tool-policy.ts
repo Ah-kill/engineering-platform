@@ -49,11 +49,13 @@ const PATH_TOOLS: Record<string, string[]> = {
 
 function insideRepo(repoRoot: string, p: unknown): boolean {
   if (typeof p !== 'string' || !p) return true; // tool defaults to the working directory
-  const resolved = path.resolve(repoRoot, p);
-  const root = path.resolve(repoRoot);
-  const rel = path.relative(root, resolved);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
-  return rel.split(path.sep)[0]?.toLowerCase() !== '.git' || !/config|hooks/i.test(rel);
+  // Inside the container paths are POSIX (/ws/repo/...); on the host they follow the OS.
+  const P = repoRoot.startsWith('/') ? path.posix : path;
+  const resolved = P.resolve(repoRoot, p);
+  const root = P.resolve(repoRoot);
+  const rel = P.relative(root, resolved);
+  if (rel.startsWith('..') || P.isAbsolute(rel)) return false;
+  return rel.split(P.sep)[0]?.toLowerCase() !== '.git' || !/config|hooks/i.test(rel);
 }
 
 export function decideTool(repoRoot: string, toolName: string, input: Record<string, unknown>, blockedPath?: string): ToolDecision {

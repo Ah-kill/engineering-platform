@@ -36,7 +36,7 @@ export async function claudeCodeVersions(): Promise<{
 }
 
 /** The SDK's exports map hides package.json, so walk up from its entry point. */
-async function readSdkPackage(): Promise<{ version: string; claudeCodeVersion?: string }> {
+export async function readSdkPackage(): Promise<{ version: string; claudeCodeVersion?: string }> {
   let dir = path.dirname(fileURLToPath(import.meta.resolve('@anthropic-ai/claude-agent-sdk')));
   for (let i = 0; i < 5; i++) {
     try {

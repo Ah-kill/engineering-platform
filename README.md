@@ -18,14 +18,16 @@ design and [docs/02-what-to-ask-clients.md](docs/02-what-to-ask-clients.md) for 
 | Claude Code in the workspace: plan / execute, streaming, approvals, stop, history, cost | Built |
 | Phone layout | Built |
 | Home: continue where you left off; delete conversations and workspaces | Built |
-| Container isolation for workspaces (Docker) | **Next.** Workspaces currently run as local processes (see Security) |
+| Container isolation: Claude Code runs in a Docker container per workspace | Built |
 | Per-environment secrets and third-party API keys (Twilio, Okta, ...) | **Next** |
 | AWS account access broker | Planned |
 | Web terminal | Planned |
 
 ## Run it locally
 
-Requirements: Node.js 22 or newer and git. The database is embedded Postgres unless you set `DATABASE_URL`.
+Requirements: Node.js 22 or newer, git, and **Docker Desktop running** (workspaces run in containers).
+The database is embedded Postgres unless you set `DATABASE_URL`. The workspace image is built automatically
+the first time a workspace opens (a few minutes), or ahead of time with `npm run runtime:build`.
 
 ```bash
 npm install
@@ -54,6 +56,9 @@ because the schema creates the restricted `platform_app` role.
 | `VAULT_KEY` | unset | Base64 32-byte key that encrypts saved credentials. Unset = generated into `VAULT_KEY_FILE` |
 | `VAULT_KEY_FILE` | `.data/vault.key` | **Back this file up.** Saved keys and tokens cannot be decrypted without it |
 | `WORKSPACES_DIR` | `~/.engineering-platform/workspaces` | Where workspace checkouts live |
+| `WORKSPACE_RUNTIME` | `docker` | `docker`: one container per workspace. `local`: on the host, no isolation (tests only) |
+| `WORKSPACE_CPUS` / `WORKSPACE_MEMORY` / `WORKSPACE_PIDS` | `2` / `4g` / `512` | Limits per workspace container |
+| `WORKSPACE_IMAGE` | `engineering-platform-workspace:<Claude Code version>` | Image to use instead of the built-in one |
 | `AGENT_MAX_TURNS` / `AGENT_MAX_BUDGET_USD` | `80` / `10` | Limits per Claude run |
 | `PORT` / `HOST` | `4000` / `127.0.0.1` | API listen address; local-only by default |
 | `WEB_ORIGIN` | `http://localhost:5173` | The only origin allowed to make changes |
@@ -90,7 +95,7 @@ Claude Code is bundled in `@anthropic-ai/claude-agent-sdk`. *Claude & GitHub* sh
 version and whether a newer one exists. To update (also brings support for newly released models):
 
 ```bash
-npm run update:claude   # installs the latest SDK and runs the API tests
+npm run update:claude   # installs the latest SDK, rebuilds the workspace image, runs the API tests
 ```
 
 The update is applied deliberately rather than automatically, so a breaking change never lands in
@@ -126,6 +131,7 @@ apps/api            Fastify API
   test/               unit and integration tests
   e2e/                isolated server for Playwright
 apps/web            React app (Vite), Monaco editor
+apps/runtime        Docker image for workspace containers
 e2e/                Playwright tests
 docs/               architecture, research, client onboarding
 infra/              templates we send to clients (read-only AWS role)
@@ -148,9 +154,17 @@ infra/              templates we send to clients (read-only AWS role)
 - Commands that carry your GitHub token (fetch, pull, push) run only while Claude is idle, only after the
   workspace's `.git/config` passes an allowlist check, with settings that can run programs, proxy traffic
   or skip TLS checks forced off, and without submodules.
-- **Current limit:** workspaces run as ordinary processes on the host. The tool policy is a guardrail,
-  not a sandbox: a determined prompt injection could still run a shell command that reads files the
-  server user can read. Until the container runtime lands, use it with repositories you trust and do not
-  expose the server to the internet. Every workspace action is audited.
+- **Workspace containers.** Claude Code runs inside a Docker container per workspace (`apps/runtime/Dockerfile`),
+  so every command it runs stays inside. The container runs as an unprivileged user with all Linux
+  capabilities dropped, `no-new-privileges`, a read-only system, and CPU, memory and process limits. It sees
+  only the checkout (read-write), the git directory (**read-only**: Claude can read history and diffs but cannot
+  change git settings or hooks) and its own home folder. No Docker socket, no host folders, no platform
+  secrets. Docker Desktop's host aliases point back at the container. After each run the container is
+  restarted, which ends anything left running in the background. Tested in `apps/api/test/docker.test.ts`.
+- **Remaining limits.** Network access from the container is open (needed for package installs and the
+  Anthropic API); a per-application allowlist comes with environment secrets. The Docker bridge gateway is
+  still reachable from inside, so keep services on your machine (such as Postgres) password-protected and
+  bound to localhost. The developer's own Claude credential is visible to commands Claude runs, as it is
+  when using Claude Code in a terminal.
 - The editor bundles Monaco, which ships its own copy of DOMPurify 3.4.15. The advisories against that
   version concern `IN_PLACE`, `SAFE_FOR_TEMPLATES` and XHTML parsing, none of which Monaco uses.
