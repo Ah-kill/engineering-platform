@@ -26,9 +26,11 @@ npm run dev
 
 Open http://localhost:5173 and sign in.
 
-To use a real Postgres server instead of the embedded one, set `DATABASE_URL`
-(for example `postgres://user:pass@localhost:5432/platform`) before `create-admin` and `dev`.
-Migrations run automatically at startup.
+To use a real Postgres server instead of the embedded one, copy `apps/api/.env.example`
+to `apps/api/.env` and set `DATABASE_URL`
+(for example `postgres://platform:pass@localhost:5432/engineering_platform`).
+`.env` is git-ignored. Migrations run automatically at startup. The database user needs
+`CREATEROLE` the first time, because the schema creates the restricted `platform_app` role.
 
 ### Settings (environment variables, all optional)
 

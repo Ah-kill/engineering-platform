@@ -4,12 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/main.ts",
-    "start": "node dist/main.js",
+    "dev": "tsx watch --env-file-if-exists=.env src/main.ts",
+    "start": "node --env-file-if-exists=.env dist/main.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "create-admin": "tsx src/cli/create-admin.ts"
+    "create-admin": "tsx --env-file-if-exists=.env src/cli/create-admin.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.15",
