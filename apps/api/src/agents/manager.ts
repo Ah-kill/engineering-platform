@@ -6,6 +6,7 @@ import { audit } from '../audit/audit.js';
 import { HttpError } from '../http/errors.js';
 import { agentEnv, type AgentDriver, type AgentEvent, type AgentMode } from './driver.js';
 import { decideTool, redactSecrets } from './tool-policy.js';
+import { isWorkspaceLocked } from '../workspaces/paths.js';
 
 export interface StoredEvent {
   id: string;
@@ -57,7 +58,7 @@ export class AgentManager {
   }
 
   activeSession(workspaceId: string): string | undefined {
-    return this.runs.get(workspaceId)?.sessionId;
+    return this.runs.get(workspaceId)?.sessionId || undefined;
   }
 
   subscribe(sessionId: string, fn: (e: StoredEvent) => void): () => void {
@@ -88,8 +89,15 @@ export class AgentManager {
   /** Starts a run in the background and returns its session id immediately. */
   async start(ctx: RunContext, input: { prompt: string; mode: AgentMode; model: string; sessionId?: string }): Promise<{ sessionId: string }> {
     if (this.runs.has(ctx.workspaceId)) throw HttpError.conflict('Claude is already working in this workspace. Stop it or wait.');
+    // Runs and git operations that carry the GitHub token are mutually exclusive. Check and
+    // reserve synchronously, before any await, so neither can slip in between.
+    if (isWorkspaceLocked(ctx.workspaceId)) throw HttpError.conflict('A git operation is in progress in this workspace; try again in a moment.');
+    const run: ActiveRun = { sessionId: '', abortController: new AbortController(), approvals: new Map() };
+    this.runs.set(ctx.workspaceId, run);
 
-    const session = await this.db.tenant(ctx.orgId, async (q) => {
+    let session: { id: string; resume?: string };
+    try {
+      session = await this.db.tenant(ctx.orgId, async (q) => {
       if (input.sessionId) {
         const [s] = await q.query<{ id: string; sdk_session_id: string | null }>(
           'SELECT id, sdk_session_id FROM agent_sessions WHERE id = $1 AND workspace_id = $2 AND user_id = $3',
@@ -107,8 +115,11 @@ export class AgentManager {
       return { id: s!.id, resume: undefined };
     });
 
-    const run: ActiveRun = { sessionId: session.id, abortController: new AbortController(), approvals: new Map() };
-    this.runs.set(ctx.workspaceId, run);
+    } catch (err) {
+      this.runs.delete(ctx.workspaceId);
+      throw err;
+    }
+    run.sessionId = session.id;
 
     await this.record(ctx, session.id, 'user', { prompt: input.prompt, mode: input.mode, model: input.model });
     await this.record(ctx, session.id, 'status', { state: 'running', mode: input.mode });

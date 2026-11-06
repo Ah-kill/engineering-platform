@@ -14,12 +14,20 @@ export function workspacePaths(workspacesDir: string, workspaceId: string) {
 
 /** Serialises git operations per workspace so two requests cannot interleave. */
 const locks = new Map<string, Promise<unknown>>();
+
+/** True while a git operation holds (or is queued on) the workspace lock. */
+export function isWorkspaceLocked(workspaceId: string): boolean {
+  return locks.has(workspaceId);
+}
 export function withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
   const prev = locks.get(workspaceId) ?? Promise.resolve();
   const next = prev.catch(() => undefined).then(fn);
   locks.set(workspaceId, next);
-  void next.finally(() => {
-    if (locks.get(workspaceId) === next) locks.delete(workspaceId);
-  });
+  // The caller handles `next`'s outcome; this cleanup chain must not raise an unhandled rejection.
+  next
+    .finally(() => {
+      if (locks.get(workspaceId) === next) locks.delete(workspaceId);
+    })
+    .catch(() => undefined);
   return next;
 }

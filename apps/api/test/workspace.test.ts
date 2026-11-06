@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { AgentDriver, AgentEvent, AgentRunInput } from '../src/agents/driver.js';
 import { runGit } from '../src/git/git.js';
+import { withWorkspaceLock } from '../src/workspaces/paths.js';
 import { Client, PASSWORD, seedOrg, setup, type TestEnv } from './helpers.js';
 
 /**
@@ -330,6 +331,16 @@ describe('recent work and conversation management', () => {
     expect(after.map((s) => s.id)).not.toContain(target);
     const [row] = await env.db.system((q) => q.query<{ n: number }>('SELECT count(*)::int AS n FROM agent_events WHERE session_id = $1', [target]));
     expect(row!.n).toBe(0);
+  });
+
+  it('will not start Claude while a git operation holds the workspace', async () => {
+    let release!: () => void;
+    const held = withWorkspaceLock(wsId, () => new Promise<void>((r) => (release = r)));
+    const r = await dev.post(`/api/workspaces/${wsId}/agent/run`, { prompt: 'x', mode: 'plan' });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error.message).toMatch(/git operation/);
+    release();
+    await held;
   });
 
   it('refuses to delete the conversation Claude is working in', async () => {

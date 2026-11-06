@@ -51,12 +51,13 @@ export function runGit(args: string[], opts: GitOptions): Promise<string> {
     ['protocol.allow', 'never'],
     ['protocol.https.allow', 'always'],
     ['protocol.file.allow', opts.allowLocalRemote ? 'always' : 'never'],
-    // No proxies or disabled TLS checks that could expose the Authorization header.
+    // Backstop only: system/global config is ignored above, and assertSafeRepoConfig()
+    // refuses any http.* or include.* key in the repository's own config before a
+    // token-bearing command runs. These keep the common proxy/TLS knobs pinned regardless.
     ['http.proxy', ''],
     ['http.https://github.com/.proxy', ''],
     ['http.sslVerify', 'true'],
     ['http.https://github.com/.sslVerify', 'true'],
-    ['http.sslCAInfo', ''],
     // Never descend into submodules, whose own configs are not checked.
     ['submodule.recurse', 'false'],
     ['fetch.recurseSubmodules', 'false'],
