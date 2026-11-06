@@ -193,6 +193,11 @@ describe('repository and workspace', () => {
     expect((await dev.post(`/api/workspaces/${wsId}/git/push`)).statusCode).toBe(200);
   });
 
+  it('pulls the pushed branch (fetch with token, merge without)', async () => {
+    const r = await dev.post(`/api/workspaces/${wsId}/git/pull`);
+    expect(r.statusCode, r.body).toBe(200);
+  });
+
   it('refuses to push to the default branch', async () => {
     expect((await dev.post(`/api/workspaces/${wsId}/git/checkout`, { branch: 'main' })).statusCode).toBe(200);
     const r = await dev.post(`/api/workspaces/${wsId}/git/push`);
@@ -335,6 +340,10 @@ describe('recent work and conversation management', () => {
     };
     const { sessionId } = (await dev.post(`/api/workspaces/${wsId}/agent/run`, { prompt: 'busy', mode: 'execute' })).json();
     expect((await dev.delete(`/api/agent/sessions/${sessionId}`)).statusCode).toBe(409);
+    // No token-bearing git while Claude (or anything it started) could be editing .git/config.
+    for (const op of ['push', 'pull', 'fetch']) {
+      expect((await dev.post(`/api/workspaces/${wsId}/git/${op}`)).statusCode, op).toBe(409);
+    }
     await dev.post(`/api/workspaces/${wsId}/agent/cancel`);
     await waitIdle(sessionId);
     expect((await dev.delete(`/api/agent/sessions/${sessionId}`)).statusCode).toBe(200);

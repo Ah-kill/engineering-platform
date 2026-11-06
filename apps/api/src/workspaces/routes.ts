@@ -182,6 +182,9 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
    * workspace's .git/config was not tampered with and limits git to the expected remote.
    */
   async function tokenGit(row: WorkspaceRow, repoDir: string, userId: string, orgId: string) {
+    // Claude (and anything it started) could rewrite .git/config between the check
+    // below and the git command, so token-bearing commands never overlap a run.
+    if (deps.agents.isRunning(row.id)) throw HttpError.conflict('Claude is working in this workspace; wait or stop it first');
     const remote = remoteFor(row.repoOwner, row.repoName);
     await git.assertSafeRepoConfig(repoDir, remote);
     const token = await db.tenant(orgId, (q) => githubToken(q, vault, userId));
@@ -276,7 +279,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     const { paths, row, user } = await ws(req);
     await withWorkspaceLock(row.id, async () => {
       const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
-      await git.runGit(['fetch', '--prune', 'origin'], { cwd: paths.repo, ...auth });
+      await git.runGit(['fetch', '--prune', '--no-recurse-submodules', 'origin'], { cwd: paths.repo, ...auth });
     });
     return git.branches(paths.repo);
   });
@@ -286,8 +289,14 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     const s = await git.status(paths.repo);
     const out = await withWorkspaceLock(row.id, async () => {
       const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
-      return git.runGit(['pull', '--ff-only', 'origin', git.assertBranch(s.branch)], { cwd: paths.repo, ...auth }).catch((e: git.GitError) => {
-        if (/couldn't find remote ref/i.test(e.message)) throw HttpError.badRequest(`Branch "${s.branch}" has not been pushed yet`);
+      const branch = git.assertBranch(s.branch);
+      // Fetch with the token, then merge without it: merging checks files out, which can
+      // run filter programs, and those must never see the token.
+      await git.runGit(['fetch', '--no-recurse-submodules', 'origin', `refs/heads/${branch}`], { cwd: paths.repo, ...auth }).catch((e: git.GitError) => {
+        if (/couldn't find remote ref/i.test(e.message)) throw HttpError.badRequest(`Branch "${branch}" has not been pushed yet`);
+        throw HttpError.badRequest(e.message);
+      });
+      return git.runGit(['merge', '--ff-only', 'FETCH_HEAD'], { cwd: paths.repo }).catch((e: git.GitError) => {
         throw HttpError.badRequest(e.message);
       });
     });
@@ -337,7 +346,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     }
     await withWorkspaceLock(row.id, async () => {
       const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
-      await git.runGit(['push', '-u', 'origin', `HEAD:refs/heads/${git.assertBranch(s.branch)}`], { cwd: paths.repo, ...auth, timeoutMs: 5 * 60_000 }).catch((e: git.GitError) => {
+      await git.runGit(['push', '--no-recurse-submodules', '-u', 'origin', `HEAD:refs/heads/${git.assertBranch(s.branch)}`], { cwd: paths.repo, ...auth, timeoutMs: 5 * 60_000 }).catch((e: git.GitError) => {
         throw HttpError.badRequest(e.message);
       });
     });

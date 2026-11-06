@@ -51,6 +51,16 @@ export function runGit(args: string[], opts: GitOptions): Promise<string> {
     ['protocol.allow', 'never'],
     ['protocol.https.allow', 'always'],
     ['protocol.file.allow', opts.allowLocalRemote ? 'always' : 'never'],
+    // No proxies or disabled TLS checks that could expose the Authorization header.
+    ['http.proxy', ''],
+    ['http.https://github.com/.proxy', ''],
+    ['http.sslVerify', 'true'],
+    ['http.https://github.com/.sslVerify', 'true'],
+    ['http.sslCAInfo', ''],
+    // Never descend into submodules, whose own configs are not checked.
+    ['submodule.recurse', 'false'],
+    ['fetch.recurseSubmodules', 'false'],
+    ['push.recurseSubmodules', 'no'],
   ];
   if (opts.token) {
     const basic = Buffer.from(`x-access-token:${opts.token}`).toString('base64');
