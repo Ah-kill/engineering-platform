@@ -177,6 +177,17 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     return { user, row, paths: workspacePaths(workspacesDir, id) };
   }
 
+  /**
+   * Prepares a git command that carries the developer's GitHub token: verifies the
+   * workspace's .git/config was not tampered with and limits git to the expected remote.
+   */
+  async function tokenGit(row: WorkspaceRow, repoDir: string, userId: string, orgId: string) {
+    const remote = remoteFor(row.repoOwner, row.repoName);
+    await git.assertSafeRepoConfig(repoDir, remote);
+    const token = await db.tenant(orgId, (q) => githubToken(q, vault, userId));
+    return { token, allowLocalRemote: !remote.startsWith('https://') };
+  }
+
   async function auditWs(user: { id: string; orgId: string }, row: WorkspaceRow, action: string, details: Record<string, unknown>) {
     await db.tenant(user.orgId, (q) =>
       audit(q, {
@@ -263,21 +274,23 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
 
   app.post('/workspaces/:id/git/fetch', async (req) => {
     const { paths, row, user } = await ws(req);
-    const token = await db.tenant(user.orgId, (q) => githubToken(q, vault, user.id));
-    await withWorkspaceLock(row.id, () => git.runGit(['fetch', '--prune', 'origin'], { cwd: paths.repo, token }));
+    await withWorkspaceLock(row.id, async () => {
+      const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
+      await git.runGit(['fetch', '--prune', 'origin'], { cwd: paths.repo, ...auth });
+    });
     return git.branches(paths.repo);
   });
 
   app.post('/workspaces/:id/git/pull', async (req) => {
     const { paths, row, user } = await ws(req);
-    const token = await db.tenant(user.orgId, (q) => githubToken(q, vault, user.id));
     const s = await git.status(paths.repo);
-    const out = await withWorkspaceLock(row.id, () =>
-      git.runGit(['pull', '--ff-only', 'origin', s.branch], { cwd: paths.repo, token }).catch((e: git.GitError) => {
+    const out = await withWorkspaceLock(row.id, async () => {
+      const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
+      return git.runGit(['pull', '--ff-only', 'origin', git.assertBranch(s.branch)], { cwd: paths.repo, ...auth }).catch((e: git.GitError) => {
         if (/couldn't find remote ref/i.test(e.message)) throw HttpError.badRequest(`Branch "${s.branch}" has not been pushed yet`);
         throw HttpError.badRequest(e.message);
-      }),
-    );
+      });
+    });
     await auditWs(user, row, 'git.pull', { branch: s.branch });
     return { output: out };
   });
@@ -322,12 +335,12 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     if (s.branch === row.defaultBranch || PROTECTED_BRANCHES.has(s.branch)) {
       throw HttpError.forbidden(`Pushing directly to "${s.branch}" is not allowed. Push a feature branch and open a pull request.`);
     }
-    const token = await db.tenant(user.orgId, (q) => githubToken(q, vault, user.id));
-    await withWorkspaceLock(row.id, () =>
-      git.runGit(['push', '-u', 'origin', `HEAD:refs/heads/${git.assertBranch(s.branch)}`], { cwd: paths.repo, token, timeoutMs: 5 * 60_000 }).catch((e: git.GitError) => {
+    await withWorkspaceLock(row.id, async () => {
+      const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
+      await git.runGit(['push', '-u', 'origin', `HEAD:refs/heads/${git.assertBranch(s.branch)}`], { cwd: paths.repo, ...auth, timeoutMs: 5 * 60_000 }).catch((e: git.GitError) => {
         throw HttpError.badRequest(e.message);
-      }),
-    );
+      });
+    });
     await auditWs(user, row, 'git.push', { branch: s.branch });
     return { ok: true, branch: s.branch };
   });

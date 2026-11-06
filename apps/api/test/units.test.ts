@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -138,5 +138,29 @@ describe('workspace path resolution', () => {
     for (const bad of ['../outside.txt', 'src/../../x', '/etc/passwd', 'C:/Windows/win.ini', '.git/config', '.GIT/hooks/pre-commit']) {
       await expect(resolveInRepo(root, bad), bad).rejects.toThrow();
     }
+  });
+
+  it('rejects Windows aliases of .git and alternate data streams', async () => {
+    await mkdir(path.join(root, '.git'), { recursive: true });
+    for (const bad of ['.git./config', '.git /config', 'GIT~1/config', 'src/a.ts:stream', 'src/a.ts.']) {
+      await expect(resolveInRepo(root, bad, { forWrite: true }), bad).rejects.toThrow();
+    }
+    expect(await resolveInRepo(root, 'notes/releases~1.txt')).toMatch(/releases~1\.txt$/);
+  });
+
+  it('refuses a directory link that leads outside the workspace', async () => {
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'ep-outside-'));
+    await symlink(outside, path.join(root, 'linked'), 'junction');
+    await expect(resolveInRepo(root, 'linked/secret.txt')).rejects.toThrow(/escapes/);
+    await expect(resolveInRepo(root, 'linked/secret.txt', { forWrite: true })).rejects.toThrow();
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('refuses to write through a dangling link (target outside, not created yet)', async () => {
+    // A directory junction needs no special rights on Windows and behaves like a symlink elsewhere.
+    const missing = path.join(os.tmpdir(), `ep-dangling-${Date.now()}`);
+    await symlink(missing, path.join(root, 'dangling'), 'junction');
+    await expect(resolveInRepo(root, 'dangling/new.txt', { forWrite: true })).rejects.toThrow();
+    await expect(resolveInRepo(root, 'dangling/new.txt')).rejects.toThrow();
   });
 });

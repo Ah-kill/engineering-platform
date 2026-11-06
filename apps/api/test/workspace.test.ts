@@ -59,12 +59,12 @@ beforeAll(async () => {
   bare = path.join(tmp, 'origin.git');
   const seed = path.join(tmp, 'seed');
   await runGit(['init', '--bare', '-b', 'main', bare], { cwd: tmp });
-  await runGit(['clone', bare, seed], { cwd: tmp });
+  await runGit(['clone', bare, seed], { cwd: tmp, allowLocalRemote: true });
   await writeFile(path.join(seed, 'README.md'), '# Payments\n');
   await writeFile(path.join(seed, 'retry.js'), 'export const retries = 3;\n');
   await runGit(['add', '-A'], { cwd: seed });
   await runGit(['commit', '-m', 'initial'], { cwd: seed, author });
-  await runGit(['push', 'origin', 'HEAD:main'], { cwd: seed });
+  await runGit(['push', 'origin', 'HEAD:main'], { cwd: seed, allowLocalRemote: true });
 
   env = await setup({ remoteFor: () => bare, agentDriver: driver });
   const { adminEmail } = await seedOrg(env.db, 'acme');
@@ -177,6 +177,20 @@ describe('repository and workspace', () => {
     expect((await dev.post(`/api/workspaces/${wsId}/git/push`)).statusCode).toBe(200);
     const remoteBranches = await runGit(['branch', '--list'], { cwd: bare });
     expect(remoteBranches).toContain('feature/retry');
+  });
+
+  it('will not use the GitHub token if .git/config was tampered with', async () => {
+    // Simulates a prompt-injected agent editing git config to run a command during push.
+    const repo = path.join(env.workspacesDir, wsId, 'repo');
+    await runGit(['config', '--local', 'core.fsmonitor', 'node -e "steal()"'], { cwd: repo });
+    const r = await dev.post(`/api/workspaces/${wsId}/git/push`);
+    expect(r.statusCode).toBe(403);
+    expect(r.json().error.message).toMatch(/core\.fsmonitor/);
+    await runGit(['config', '--local', 'url.https://evil.example/.insteadOf', 'https://github.com/'], { cwd: repo });
+    await runGit(['config', '--local', '--unset', 'core.fsmonitor'], { cwd: repo });
+    expect((await dev.post(`/api/workspaces/${wsId}/git/fetch`)).statusCode).toBe(403);
+    await runGit(['config', '--local', '--remove-section', 'url.https://evil.example/'], { cwd: repo });
+    expect((await dev.post(`/api/workspaces/${wsId}/git/push`)).statusCode).toBe(200);
   });
 
   it('refuses to push to the default branch', async () => {

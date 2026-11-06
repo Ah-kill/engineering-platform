@@ -104,6 +104,7 @@ export async function provisionWorkspace(
       cwd: paths.root,
       token: opts.token,
       timeoutMs: 10 * 60_000,
+      allowLocalRemote: !opts.remote.startsWith('https://'),
     });
     if (opts.createBranch) {
       await runGit(['checkout', '-B', assertBranch(opts.branch), `origin/${assertBranch(opts.baseBranch)}`], { cwd: paths.repo });

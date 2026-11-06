@@ -11,6 +11,8 @@ export interface GitOptions {
   token?: string;
   timeoutMs?: number;
   author?: { name: string; email: string };
+  /** Allow local-path remotes (used by tests and the e2e stack). Network remotes are https only. */
+  allowLocalRemote?: boolean;
 }
 
 export class GitError extends Error {
@@ -33,9 +35,22 @@ export function runGit(args: string[], opts: GitOptions): Promise<string> {
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
   });
+  const devNull = process.platform === 'win32' ? 'NUL' : '/dev/null';
+  // Command-line-level config outranks the repository's own .git/config, which Claude can
+  // write to. These switch off every setting that makes git run a program or change where
+  // it connects. assertSafeRepoConfig() additionally gates token-bearing commands.
   const extra: [string, string][] = [
     ['credential.helper', ''],
-    ['core.hooksPath', process.platform === 'win32' ? 'NUL' : '/dev/null'],
+    ['core.hooksPath', devNull],
+    ['core.fsmonitor', 'false'],
+    ['core.sshCommand', 'false'],
+    ['core.pager', 'cat'],
+    ['core.editor', 'false'],
+    ['core.askPass', ''],
+    ['diff.external', ''],
+    ['protocol.allow', 'never'],
+    ['protocol.https.allow', 'always'],
+    ['protocol.file.allow', opts.allowLocalRemote ? 'always' : 'never'],
   ];
   if (opts.token) {
     const basic = Buffer.from(`x-access-token:${opts.token}`).toString('base64');
@@ -68,6 +83,40 @@ export function runGit(args: string[], opts: GitOptions): Promise<string> {
 
 function redactToken(text: string, token?: string): string {
   return token ? text.split(token).join('***') : text;
+}
+
+/**
+ * Keys the platform's own git usage produces in a clone's .git/config. Anything else
+ * (url.*.insteadOf, filter.*, include.path, alias.*, core.fsmonitor, http.*, ...) means
+ * the config was edited, possibly by a prompt-injected agent, and no command carrying
+ * the developer's token may run until it is reset.
+ */
+const SAFE_CONFIG_KEYS: RegExp[] = [
+  /^core\.(repositoryformatversion|filemode|bare|logallrefupdates|symlinks|ignorecase|precomposeunicode|autocrlf)$/,
+  /^remote\.origin\.(url|fetch|tagopt)$/,
+  /^branch\.[^\s]+\.(remote|merge)$/,
+  /^extensions\.objectformat$/,
+  /^user\.(name|email)$/,
+];
+
+export async function assertSafeRepoConfig(cwd: string, expectedRemote: string): Promise<void> {
+  const out = await runGit(['config', '--local', '--list', '--null'], { cwd });
+  const entries = out.split('\0').filter(Boolean).map((e) => {
+    const nl = e.indexOf('\n');
+    return nl === -1 ? { key: e.toLowerCase(), value: '' } : { key: e.slice(0, nl).toLowerCase(), value: e.slice(nl + 1) };
+  });
+  const bad = entries.filter((e) => !SAFE_CONFIG_KEYS.some((re) => re.test(e.key))).map((e) => e.key);
+  const tagopt = entries.find((e) => e.key === 'remote.origin.tagopt');
+  if (tagopt && !['--no-tags', '--tags'].includes(tagopt.value)) bad.push('remote.origin.tagopt');
+  const url = entries.find((e) => e.key === 'remote.origin.url')?.value;
+  if (url !== expectedRemote) bad.push('remote.origin.url');
+  const branchRemotes = entries.filter((e) => /^branch\..+\.remote$/.test(e.key) && e.value !== 'origin');
+  bad.push(...branchRemotes.map((e) => e.key));
+  if (bad.length) {
+    throw HttpError.forbidden(
+      `This workspace's git configuration was changed (${[...new Set(bad)].slice(0, 5).join(', ')}), so the platform will not use your GitHub token with it. Recreate the workspace.`,
+    );
+  }
 }
 
 /** Branch names: conservative subset of git's rules. */

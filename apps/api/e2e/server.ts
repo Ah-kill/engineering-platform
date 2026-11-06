@@ -34,13 +34,13 @@ const bare = path.join(remotes, 'acme', 'payments.git');
 await mkdir(path.dirname(bare), { recursive: true });
 await runGit(['init', '--bare', '-b', 'main', bare], { cwd: root });
 const seed = path.join(root, 'seed');
-await runGit(['clone', bare, seed], { cwd: root });
+await runGit(['clone', bare, seed], { cwd: root, allowLocalRemote: true });
 await mkdir(path.join(seed, 'src'));
 await writeFile(path.join(seed, 'README.md'), '# Payment Service\n');
 await writeFile(path.join(seed, 'src', 'retry.js'), 'export const MAX_RETRIES = 3;\n');
 await runGit(['add', '-A'], { cwd: seed });
 await runGit(['commit', '-m', 'Initial commit'], { cwd: seed, author: { name: 'Seed', email: 'seed@example.com' } });
-await runGit(['push', 'origin', 'HEAD:main'], { cwd: seed });
+await runGit(['push', 'origin', 'HEAD:main'], { cwd: seed, allowLocalRemote: true });
 
 const db = await openPglite(path.join(root, 'pg'));
 await migrate(db);
