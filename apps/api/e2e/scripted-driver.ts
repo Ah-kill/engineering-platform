@@ -15,6 +15,15 @@ export class ScriptedDriver implements AgentDriver {
     const opts = { signal } as Parameters<AgentRunInput['canUseTool']>[2];
     yield { kind: 'session', sdkSessionId: `scripted-${Date.now()}` };
 
+    if (/environment variables/i.test(input.prompt)) {
+      // Reports what the platform gave it, and (deliberately) tries to print a secret value.
+      const names = /Environment variables set for this environment[^:]*: ([A-Z0-9_, ]+)\./.exec(input.appendSystemPrompt)?.[1] ?? 'none';
+      yield { kind: 'text', text: `Variables I can use: ${names}` };
+      yield { kind: 'text', text: `PAYMENT_SECRET is ${input.env.PAYMENT_SECRET ?? 'missing'}` };
+      yield { kind: 'result', isError: false, subtype: 'success', costUsd: 0.001, inputTokens: 10, outputTokens: 5, durationMs: 100, text: 'Done' };
+      return;
+    }
+
     if (input.mode === 'plan') {
       yield { kind: 'text', text: 'Let me look at how retries work.' };
       yield { kind: 'tool_use', toolUseId: 't1', name: 'Read', input: { file_path: path.join(input.cwd, 'src/retry.js') } };
