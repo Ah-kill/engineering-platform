@@ -21,6 +21,9 @@ RUN git config --system --add safe.directory /ws/repo  && git config --system --
 # Outbound filter used in restricted network mode (runs in its own small container).
 COPY egress-proxy.mjs /opt/platform/egress-proxy.mjs
 
+# Gives the browser terminal a real pseudo-terminal (with resizing) over `docker exec -i`.
+COPY pty-bridge.py /opt/platform/pty-bridge.py
+
 # Unprivileged user (uid 1000 from the node image). /home/agent is a per-workspace volume.
 RUN mkdir -p /home/agent /ws/repo /ws/git && chown -R node:node /home/agent /ws
 USER node

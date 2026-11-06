@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { api } from '../api';
 import { useAuth } from '../auth';
-import { useAction } from '../hooks';
+import { useAction, useResource } from '../hooks';
 
 export function AccountPage() {
   const { me } = useAuth();
@@ -35,6 +35,203 @@ export function AccountPage() {
         {saved && <div className="badge ok">Password changed. Other devices were signed out.</div>}
         <button className="primary" disabled={action.pending}>Change password</button>
       </form>
+      <TwoStepLogin />
     </div>
+  );
+}
+
+interface MfaStatus { enabled: boolean; recoveryCodesLeft: number }
+interface MfaSetup { otpauthUrl: string; qrDataUrl: string; secret: string }
+
+/** Authenticator-app sign-in: set up, recovery codes, turn off. */
+function TwoStepLogin() {
+  const status = useResource<MfaStatus>('/me/mfa');
+  const [setup, setSetup] = useState<MfaSetup | null>(null);
+  /** Shown once, right after they are created. */
+  const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
+  const [notice, setNotice] = useState<string | undefined>();
+
+  const start = useAction(async () => {
+    setNotice(undefined);
+    setSetup(await api<MfaSetup>('POST', '/me/mfa/setup'));
+  });
+
+  if (status.loading && !status.data) return <div className="card muted">Loading two-step login…</div>;
+  if (status.error) return <div className="card error">{status.error.message}</div>;
+  const enabled = status.data?.enabled ?? false;
+  const left = status.data?.recoveryCodesLeft ?? 0;
+
+  return (
+    <section className="card form">
+      <div className="mfa-head">
+        <h2>Two-step login</h2>
+        {enabled ? <span className="badge ok">On</span> : <span className="badge">Off</span>}
+      </div>
+
+      {recoveryCodes && <RecoveryCodes codes={recoveryCodes} onDone={() => setRecoveryCodes(null)} />}
+      {notice && <div className="badge ok mfa-notice">{notice}</div>}
+
+      {!enabled && !setup && (
+        <>
+          <p className="muted" style={{ margin: 0 }}>
+            After your password, sign-in also asks for a 6-digit code from an authenticator app on your phone
+            (Google Authenticator, Microsoft Authenticator, 1Password and similar).
+          </p>
+          {start.error && <div className="error">{start.error}</div>}
+          <div><button className="primary" disabled={start.pending} onClick={() => void start.run()}>Set up two-step login</button></div>
+        </>
+      )}
+
+      {!enabled && setup && (
+        <EnableForm
+          setup={setup}
+          onCancel={() => setSetup(null)}
+          onEnabled={async (codes) => {
+            setSetup(null);
+            setRecoveryCodes(codes);
+            setNotice('Two-step login is on. Other devices were signed out.');
+            await status.reload();
+          }}
+        />
+      )}
+
+      {enabled && (
+        <>
+          <p className="muted" style={{ margin: 0 }}>
+            {left} of 10 recovery codes left.{left <= 3 && ' Make new ones before you run out.'}
+          </p>
+          <RegenerateForm onDone={async (codes) => { setNotice(undefined); setRecoveryCodes(codes); await status.reload(); }} />
+          <DisableForm onDone={async () => { setRecoveryCodes(null); setNotice('Two-step login is off.'); await status.reload(); }} />
+        </>
+      )}
+    </section>
+  );
+}
+
+function EnableForm({ setup, onCancel, onEnabled }: { setup: MfaSetup; onCancel(): void; onEnabled(codes: string[]): Promise<void> }) {
+  const [code, setCode] = useState('');
+  const action = useAction(async () => {
+    const res = await api<{ recoveryCodes: string[] }>('POST', '/me/mfa/enable', { code: code.trim() });
+    await onEnabled(res.recoveryCodes);
+  });
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    void action.run();
+  };
+  return (
+    <form className="form" onSubmit={submit}>
+      <div>1. Scan this QR code with your authenticator app.</div>
+      <img className="mfa-qr" src={setup.qrDataUrl} width={200} height={200} alt="QR code to add this account to an authenticator app" />
+      <div className="muted mfa-manual">
+        Can’t scan it? Add the account by hand with this key (time-based):
+        <code className="mfa-secret">{setup.secret.match(/.{1,4}/g)?.join(' ')}</code>
+      </div>
+      <div>2. Enter the 6-digit code the app shows.</div>
+      <label>
+        Code from the app
+        <input required inputMode="numeric" autoComplete="one-time-code" pattern="[0-9 ]{6,7}" maxLength={7}
+          className="mfa-code-input" placeholder="123456" value={code} onChange={(e) => setCode(e.target.value)} />
+      </label>
+      {action.error && <div className="error">{action.error}</div>}
+      <div className="form-row">
+        <button className="primary" disabled={action.pending}>Turn on</button>
+        <button type="button" onClick={onCancel}>Cancel</button>
+      </div>
+    </form>
+  );
+}
+
+function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone(): void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(codes.join('\n'));
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <div className="mfa-recovery" role="region" aria-label="Recovery codes">
+      <strong>Save your recovery codes</strong>
+      <p className="muted" style={{ margin: 0 }}>
+        If you lose your phone, each of these codes signs you in once. They are shown only now:
+        keep them somewhere safe, such as a password manager.
+      </p>
+      <ul className="mfa-code-list">
+        {codes.map((c) => <li key={c}><code>{c}</code></li>)}
+      </ul>
+      <div className="form-row">
+        <button type="button" onClick={() => void copy()}>{copied ? 'Copied' : 'Copy codes'}</button>
+        <button type="button" className="primary" onClick={onDone}>I have saved them</button>
+      </div>
+    </div>
+  );
+}
+
+function RegenerateForm({ onDone }: { onDone(codes: string[]): Promise<void> }) {
+  const [open, setOpen] = useState(false);
+  const [code, setCode] = useState('');
+  const action = useAction(async () => {
+    const res = await api<{ recoveryCodes: string[] }>('POST', '/me/mfa/recovery-codes', { code: code.trim() });
+    setCode('');
+    setOpen(false);
+    await onDone(res.recoveryCodes);
+  });
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    void action.run();
+  };
+  if (!open) return <div><button type="button" onClick={() => setOpen(true)}>Make new recovery codes</button></div>;
+  return (
+    <form className="form mfa-sub" onSubmit={submit}>
+      <strong>New recovery codes</strong>
+      <span className="muted">Your current recovery codes stop working.</span>
+      <label>
+        Code from your authenticator app
+        <input required autoFocus inputMode="numeric" autoComplete="one-time-code" maxLength={64}
+          className="mfa-code-input" value={code} onChange={(e) => setCode(e.target.value)} />
+      </label>
+      {action.error && <div className="error">{action.error}</div>}
+      <div className="form-row">
+        <button className="primary" disabled={action.pending}>Make new codes</button>
+        <button type="button" onClick={() => { setOpen(false); action.clearError(); }}>Cancel</button>
+      </div>
+    </form>
+  );
+}
+
+function DisableForm({ onDone }: { onDone(): Promise<void> }) {
+  const [open, setOpen] = useState(false);
+  const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const action = useAction(async () => {
+    await api('POST', '/me/mfa/disable', { password, code: code.trim() });
+    setPassword('');
+    setCode('');
+    setOpen(false);
+    await onDone();
+  });
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    void action.run();
+  };
+  if (!open) return <div><button type="button" className="danger" onClick={() => setOpen(true)}>Turn off two-step login</button></div>;
+  return (
+    <form className="form mfa-sub" onSubmit={submit}>
+      <strong>Turn off two-step login</strong>
+      <span className="muted">Sign-in will need only your password.</span>
+      <label>Password<input type="password" required autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+      <label>
+        Code from your authenticator app, or a recovery code
+        <input required autoComplete="one-time-code" maxLength={64} className="mfa-code-input"
+          value={code} onChange={(e) => setCode(e.target.value)} />
+      </label>
+      {action.error && <div className="error">{action.error}</div>}
+      <div className="form-row">
+        <button className="danger" disabled={action.pending}>Turn off</button>
+        <button type="button" onClick={() => { setOpen(false); action.clearError(); }}>Cancel</button>
+      </div>
+    </form>
   );
 }

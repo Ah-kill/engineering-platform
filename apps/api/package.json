@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch --env-file-if-exists=.env src/main.ts",
     "start": "node --env-file-if-exists=.env dist/main.js",
+    "start:prod": "node --env-file-if-exists=.env -e \"process.env.NODE_ENV='production'; process.env.SERVE_WEB ??= 'true'; import('./dist/main.js')\"",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",

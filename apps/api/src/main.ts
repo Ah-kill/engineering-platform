@@ -49,6 +49,11 @@ if (runtime.kind === 'docker') {
 if (vaultCreated) app.log.warn(`generated a new credential encryption key at ${config.VAULT_KEY_FILE}; back it up, saved credentials cannot be decrypted without it`);
 app.log.info(config.DATABASE_URL ? 'using Postgres from DATABASE_URL' : `using embedded Postgres in ${config.DATA_DIR}`);
 app.log.info(`workspaces in ${workspacesDir}`);
+if (config.SERVE_WEB) {
+  app.log.info(`serving the web app for ${config.WEB_ORIGIN}`);
+  // The browser origin must equal WEB_ORIGIN exactly, or every change is refused.
+  if (new URL(config.WEB_ORIGIN).port === '5173') app.log.warn('SERVE_WEB=true but WEB_ORIGIN still points at the Vite dev server; set it to the public URL');
+}
 
 const shutdown = async () => {
   await app.close();

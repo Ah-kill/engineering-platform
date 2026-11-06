@@ -9,6 +9,7 @@ import { ClientPage } from './pages/ClientPage';
 import { ApplicationPage } from './pages/ApplicationPage';
 import { UsersPage } from './pages/UsersPage';
 import { AuditPage } from './pages/AuditPage';
+import { UsagePage } from './pages/UsagePage';
 import { AccountPage } from './pages/AccountPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { HomePage } from './pages/HomePage';
@@ -32,6 +33,7 @@ function App() {
         <Route path="/applications/:id" element={<ApplicationPage />} />
         <Route path="/users" element={<UsersPage />} />
         <Route path="/audit" element={<AuditPage />} />
+        <Route path="/usage" element={<UsagePage />} />
         <Route path="/account" element={<AccountPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<p className="muted">Page not found.</p>} />

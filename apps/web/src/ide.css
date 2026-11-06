@@ -136,3 +136,28 @@ a.btn { display: inline-block; color: var(--text); text-decoration: none; }
 /* environment variables and network access */
 .var-value { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .host-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; }
+
+/* ---- browser terminal (components/ws/TerminalPanel.tsx) ------------------- */
+.ide-bottom { display: flex; flex-direction: column; border-top: 1px solid var(--border); background: var(--surface); min-height: 0; }
+.ide-bottom .ide-log { border-top: 0; }
+.ide-bottom [hidden] { display: none !important; }
+.bottom-tabs { display: flex; border-bottom: 1px solid var(--border); }
+.bottom-tabs button { border: 0; border-radius: 0; background: transparent; padding: 5px 12px; font-size: 12.5px; color: var(--muted); }
+.bottom-tabs button.on { color: var(--text); font-weight: 600; box-shadow: inset 0 -2px 0 var(--accent); }
+.ide-term { height: clamp(200px, 36vh, 440px); display: flex; min-height: 0; }
+.term { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; background: var(--surface); }
+.term-bar { display: flex; align-items: center; gap: 6px; padding: 3px 8px; border-bottom: 1px solid var(--border); font-size: 12px; min-height: 30px; }
+.term-status { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.term-status.error { color: var(--danger); white-space: normal; }
+.term-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: none; }
+.term-dot.open { background: #2e9c4f; }
+.term-dot.connecting { background: #c08a00; }
+.term-dot.error, .term-dot.closed { background: var(--danger); }
+.term-host { flex: 1; min-height: 0; padding: 4px 0 0 6px; overflow: hidden; }
+.term-host .xterm { height: 100%; }
+.term-host .xterm-viewport { background: transparent !important; }
+.term-keys { display: flex; gap: 4px; padding: 6px; border-top: 1px solid var(--border); overflow-x: auto; }
+.term-keys button { flex: 1 0 auto; min-width: 40px; min-height: 40px; padding: 4px 8px; font-family: var(--mono); font-size: 13px; }
+/* Five tabs on phones; columns follow however many buttons there are. */
+.ide-tabbar { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
+.ide-tabbar button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 2px; padding-right: 2px; }

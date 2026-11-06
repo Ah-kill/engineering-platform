@@ -74,7 +74,7 @@ export interface GrantRow {
 
 export interface UserRow {
   id: string; email: string; displayName: string; isOrgAdmin: boolean;
-  status: 'active' | 'disabled'; createdAt: string; lastLoginAt: string | null;
+  status: 'active' | 'disabled'; createdAt: string; lastLoginAt: string | null; mfaEnabled: boolean;
 }
 
 export type CredentialKind = 'anthropic_api_key' | 'claude_oauth_token' | 'github_token';

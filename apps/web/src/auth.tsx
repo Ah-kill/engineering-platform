@@ -1,11 +1,16 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { api, ApiError, type Me } from './api';
 
+/** Signed in, or the password was right and a two-step code is needed for this challenge. */
+export type LoginResult = { done: true } | { done: false; challenge: string };
+
 interface AuthState {
   me: Me | null;
   loading: boolean;
   refresh(): Promise<void>;
-  login(email: string, password: string): Promise<void>;
+  login(email: string, password: string): Promise<LoginResult>;
+  /** Second step: a 6-digit authenticator code or a recovery code. */
+  loginWithCode(challenge: string, code: string): Promise<void>;
   logout(): Promise<void>;
 }
 
@@ -30,8 +35,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void refresh();
   }, [refresh]);
 
-  const login = async (email: string, password: string) => {
-    await api('POST', '/auth/login', { email, password });
+  const login = async (email: string, password: string): Promise<LoginResult> => {
+    const res = await api<{ ok?: true; mfaRequired?: true; challenge?: string }>('POST', '/auth/login', { email, password });
+    if (res.mfaRequired && res.challenge) return { done: false, challenge: res.challenge };
+    await refresh();
+    return { done: true };
+  };
+
+  const loginWithCode = async (challenge: string, code: string) => {
+    await api('POST', '/auth/login/mfa', { challenge, code });
     await refresh();
   };
 
@@ -40,7 +52,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setMe(null);
   };
 
-  return <AuthContext.Provider value={{ me, loading, refresh, login, logout }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ me, loading, refresh, login, loginWithCode, logout }}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth(): AuthState {

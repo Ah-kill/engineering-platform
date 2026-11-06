@@ -12,7 +12,8 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       // The browser only talks to this origin; the API stays on localhost.
-      '/api': { target: apiTarget, changeOrigin: false },
+      // ws: the browser terminal is a WebSocket under /api.
+      '/api': { target: apiTarget, changeOrigin: false, ws: true },
     },
   },
 });

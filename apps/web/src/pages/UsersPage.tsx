@@ -3,12 +3,16 @@ import { api, type UserRow } from '../api';
 import { useAuth } from '../auth';
 import { useAction, useResource } from '../hooks';
 
+/** The users list also says whether each person has two-step login on. */
+type UserWithMfa = UserRow & { mfaEnabled?: boolean };
+type UserPatch = Partial<Pick<UserRow, 'status' | 'isOrgAdmin'>> & { resetMfa?: true };
+
 export function UsersPage() {
   const { me } = useAuth();
-  const users = useResource<UserRow[]>(me?.user.isOrgAdmin ? '/users' : null);
+  const users = useResource<UserWithMfa[]>(me?.user.isOrgAdmin ? '/users' : null);
   const [creating, setCreating] = useState(false);
 
-  const update = useAction(async (id: string, patch: Partial<Pick<UserRow, 'status' | 'isOrgAdmin'>>) => {
+  const update = useAction(async (id: string, patch: UserPatch) => {
     await api('PATCH', `/users/${id}`, patch);
     await users.reload();
   });
@@ -25,7 +29,7 @@ export function UsersPage() {
       <div className="card table-wrap">
         {users.error && <div className="error">{users.error.message}</div>}
         <table>
-          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last sign-in</th><th /></tr></thead>
+          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Two-step</th><th>Last sign-in</th><th /></tr></thead>
           <tbody>
             {users.data?.map((u) => (
               <tr key={u.id}>
@@ -33,6 +37,7 @@ export function UsersPage() {
                 <td className="muted">{u.email}</td>
                 <td>{u.isOrgAdmin ? <span className="badge warn">org admin</span> : 'developer'}</td>
                 <td>{u.status === 'active' ? <span className="badge ok">active</span> : <span className="badge">disabled</span>}</td>
+                <td>{u.mfaEnabled ? <span className="badge ok">on</span> : <span className="badge">off</span>}</td>
                 <td className="muted">{u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : 'never'}</td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                   {u.id !== me.user.id && (
@@ -44,6 +49,18 @@ export function UsersPage() {
                         onClick={() => void update.run(u.id, { status: u.status === 'active' ? 'disabled' : 'active' })}>
                         {u.status === 'active' ? 'Disable' : 'Enable'}
                       </button>
+                      {u.mfaEnabled && (
+                        <>
+                          {' '}
+                          <button className="small danger" disabled={update.pending}
+                            onClick={() => {
+                              const ok = confirm(`Reset two-step login for ${u.displayName}? They will be signed out and can sign in with their password alone until they set it up again.`);
+                              if (ok) void update.run(u.id, { resetMfa: true });
+                            }}>
+                            Reset two-step login
+                          </button>
+                        </>
+                      )}
                     </>
                   )}
                 </td>

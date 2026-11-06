@@ -89,6 +89,40 @@ export async function separateGitDir(ws: WorkspaceDirs): Promise<void> {
 
 const CONTAINER_REPO = '/ws/repo';
 
+/**
+ * Runs inside the container: kills every process except PID 1 (init), the keep-alive
+ * `sleep infinity`, terminal bridges and their descendants, and itself.
+ */
+const SWEEP_SCRIPT = `
+import os, signal
+me = os.getpid()
+procs = {}
+for pid in os.listdir('/proc'):
+    if not pid.isdigit():
+        continue
+    try:
+        with open('/proc/%s/stat' % pid) as f:
+            ppid = int(f.read().rsplit(')', 1)[1].split()[1])
+        with open('/proc/%s/cmdline' % pid, 'rb') as f:
+            cmd = f.read().replace(b'\\0', b' ').decode(errors='replace')
+        procs[int(pid)] = (ppid, cmd)
+    except Exception:
+        pass
+def keep(pid, seen=()):
+    if pid in (1, me) or pid in seen:
+        return True
+    ppid, cmd = procs.get(pid, (0, ''))
+    if 'pty-bridge.py' in cmd or (ppid == 1 and cmd.strip() == 'sleep infinity'):
+        return True
+    return ppid in procs and ppid != 1 and keep(ppid, seen + (pid,))
+for pid in procs:
+    if not keep(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+`;
+
 /** Variables that describe the host machine and must not be copied into a container. */
 const HOST_ONLY_ENV = new Set([
   'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'APPDATA',
@@ -97,7 +131,7 @@ const HOST_ONLY_ENV = new Set([
 ]);
 
 /** Bump when apps/runtime changes, so a fresh image is built instead of reusing an old one. */
-export const RUNTIME_REVISION = 'r3';
+export const RUNTIME_REVISION = 'r4';
 
 export function defaultImage(claudeCodeVersion: string): string {
   return `engineering-platform-workspace:${claudeCodeVersion}-${RUNTIME_REVISION}`;
@@ -253,9 +287,12 @@ export class DockerRuntime implements WorkspaceRuntime {
   }
 
   async recycle(workspaceId: string): Promise<void> {
-    // Restarting ends every process inside (including anything left in the background)
-    // while keeping the files.
-    await run(['restart', '-t', '2', DockerRuntime.containerName(workspaceId)]).catch(() => undefined);
+    // End everything the agent left behind (including background processes) but keep the
+    // container's init, its keep-alive process and the developer's terminal shells. If that
+    // cannot be done, restart the container, which ends every process and keeps the files.
+    const name = DockerRuntime.containerName(workspaceId);
+    const swept = await run(['exec', name, 'python3', '-c', SWEEP_SCRIPT], { timeoutMs: 20_000 }).then(() => true, () => false);
+    if (!swept) await run(['restart', '-t', '2', name]).catch(() => undefined);
   }
 
   async remove(workspaceId: string): Promise<void> {

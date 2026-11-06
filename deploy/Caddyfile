@@ -1,0 +1,32 @@
+# Caddy in front of the Engineering Platform: automatic HTTPS (Let's Encrypt) and a
+# reverse proxy to the API, which also serves the web app (SERVE_WEB=true).
+# Install: sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
+# Replace platform.example.com with your DNS name. It must point at this server, and
+# ports 80 and 443 must be open for the certificate challenge.
+# WEB_ORIGIN in platform.env must be exactly https://platform.example.com
+
+{
+	email ops@example.com
+}
+
+platform.example.com {
+	# Compress the web app's files only. The API streams Server-Sent Events (agent output),
+	# and those must not be held back by a compressor.
+	@web not path /api/*
+	encode @web zstd gzip
+
+	reverse_proxy 127.0.0.1:4000 {
+		# Send streamed responses (SSE) to the browser immediately.
+		flush_interval -1
+		# WebSocket upgrades (web terminal) pass through reverse_proxy automatically, with
+		# the original Host and Origin. Keep open sockets alive across a `caddy reload`.
+		stream_close_delay 5m
+	}
+
+	log {
+		output file /var/log/caddy/platform.log {
+			roll_size 20MiB
+			roll_keep 10
+		}
+	}
+}

@@ -4,11 +4,12 @@ import { requirePermission } from '../access/authorize.js';
 import { audit } from '../audit/audit.js';
 import { caller, type RouteDeps } from '../http/app.js';
 import { HttpError, mapDbError } from '../http/errors.js';
+import { clearChallenges, clearMfa } from './mfa.js';
 import { hashPassword, MIN_PASSWORD_LENGTH } from './passwords.js';
 import { revokeUserSessions } from './sessions.js';
 
 const USER_COLUMNS = `id, email, display_name AS "displayName", is_org_admin AS "isOrgAdmin",
-  status, created_at AS "createdAt", last_login_at AS "lastLoginAt"`;
+  status, mfa_enabled AS "mfaEnabled", created_at AS "createdAt", last_login_at AS "lastLoginAt"`;
 
 const createUserBody = z.object({
   email: z.string().trim().toLowerCase().email().max(320),
@@ -23,6 +24,8 @@ const updateUserBody = z
     isOrgAdmin: z.boolean(),
     status: z.enum(['active', 'disabled']),
     password: z.string().min(MIN_PASSWORD_LENGTH).max(1024),
+    /** Turns off the user's two-step login (lost phone). They set it up again after signing in. */
+    resetMfa: z.boolean(),
   })
   .partial();
 
@@ -78,10 +81,15 @@ export async function userRoutes(app: FastifyInstance, { db }: RouteDeps) {
     if (id === user.id && (body.status === 'disabled' || body.isOrgAdmin === false)) {
       throw HttpError.badRequest('You cannot disable yourself or remove your own admin role');
     }
+    if (id === user.id && body.resetMfa) {
+      throw HttpError.badRequest('Turn off your own two-step login on the Account page');
+    }
     const passwordHash = body.password ? await hashPassword(body.password) : null;
 
     const updated = await db.tenant(user.orgId, async (q) => {
       await requirePermission(q, principalOf(user), 'org.manage_users', { type: 'org' });
+      // Before the update below, so its RETURNING row already shows the reset.
+      if (body.resetMfa) await clearMfa(q, id);
       const [row] = await q.query(
         `UPDATE users SET
            display_name  = coalesce($2, display_name),
@@ -104,12 +112,14 @@ export async function userRoutes(app: FastifyInstance, { db }: RouteDeps) {
           isOrgAdmin: body.isOrgAdmin,
           status: body.status,
           passwordReset: passwordHash !== null,
+          mfaReset: body.resetMfa === true,
         },
       });
       return row;
     });
 
-    if (body.status === 'disabled' || passwordHash) await revokeUserSessions(db, id);
+    if (body.status === 'disabled' || passwordHash || body.resetMfa) await revokeUserSessions(db, id);
+    if (body.resetMfa) await clearChallenges(db, id);
     return updated;
   });
 }

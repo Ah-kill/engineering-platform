@@ -13,7 +13,8 @@ export const MAX_VALUE_BYTES = 32 * 1024;
 
 /** Names the platform or the runtime controls; letting a project override them would break or bypass isolation. */
 const RESERVED = new Set(['PATH', 'HOME', 'USER', 'SHELL', 'PWD', 'HOSTNAME', 'TERM', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'NODE_OPTIONS', 'NO_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY']);
-const RESERVED_PREFIXES = ['CLAUDE_', 'ANTHROPIC_', 'GIT_', 'DOCKER_', 'NODE_USE_ENV_PROXY'];
+// AWS_* is issued by the AWS broker as short-lived credentials; long-lived keys must not be pasted in.
+const RESERVED_PREFIXES = ['CLAUDE_', 'ANTHROPIC_', 'GIT_', 'DOCKER_', 'NODE_USE_ENV_PROXY', 'AWS_'];
 
 export function validateName(name: string): string {
   if (!VAR_NAME.test(name)) throw HttpError.badRequest('Use upper-case letters, digits and underscores, e.g. PAYMENT_API_KEY');

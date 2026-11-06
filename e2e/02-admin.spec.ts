@@ -33,12 +33,12 @@ test.describe('admin onboards a client', () => {
     await openPaymentService(page);
     await page.getByRole('button', { name: 'Connect GitHub repository' }).click();
     await page.getByLabel('GitHub URL').fill('https://evil.example.com/acme/payments');
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
     await expect(page.getByText(/Use a GitHub repository URL/)).toBeVisible();
 
     await page.getByLabel('GitHub URL').fill('https://github.com/acme/payments');
     await page.getByLabel('Default branch').fill('main');
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
     await expect(page.getByRole('link', { name: 'acme/payments' })).toBeVisible();
   });
 

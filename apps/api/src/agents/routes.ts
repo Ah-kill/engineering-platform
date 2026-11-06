@@ -12,6 +12,8 @@ import { agentEnv } from './driver.js';
 import { listModels } from './models.js';
 import { claudeCodeVersions } from './version.js';
 import { resolveVariables } from '../variables/variables.js';
+import { awsSecretValues, issueAwsEnvForRun, withAwsHosts } from '../aws/aws.js';
+import { getStsClient } from '../aws/sts.js';
 import path from 'node:path';
 
 const idParam = z.object({ id: z.string().uuid() });
@@ -126,6 +128,16 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
       return { ws, model: body.model ?? settings.defaultModel, auth, vars };
     });
     const paths = workspacePaths(workspacesDir, id);
+    // Short-lived AWS credentials when the environment has a role configured. A failure is
+    // audited by the broker; the run continues without AWS rather than failing outright.
+    const aws = agents.isRunning(id)
+      ? null
+      : await issueAwsEnvForRun(db, user.orgId, vault, getStsClient(), {
+          environmentId: ctx.ws.environmentId, userId: user.id, workspaceId: id, isOrgAdmin: user.isOrgAdmin,
+        }).catch((err: Error) => {
+          req.log.warn({ err: err.message }, 'AWS credentials not issued');
+          return null;
+        });
     return agents.start(
       {
         orgId: user.orgId,
@@ -140,9 +152,10 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
         labels: { client: ctx.ws.clientName, application: ctx.ws.applicationName, environment: ctx.ws.environmentName, branch: ctx.ws.branch },
         authEnv: ctx.auth.env,
         authMode: ctx.auth.mode,
-        appEnv: ctx.vars.env,
-        appSecrets: ctx.vars.secretValues,
-        network: { mode: ctx.ws.egressMode, hosts: ctx.ws.egressHosts },
+        // Broker values win over any same-named variable.
+        appEnv: { ...ctx.vars.env, ...(aws ?? {}) },
+        appSecrets: [...ctx.vars.secretValues, ...awsSecretValues(aws)],
+        network: { mode: ctx.ws.egressMode, hosts: withAwsHosts(ctx.ws.egressHosts, aws !== null) },
       },
       { prompt: body.prompt, mode: body.mode, model: ctx.model, sessionId: body.sessionId },
     );

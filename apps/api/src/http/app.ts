@@ -15,6 +15,9 @@ import { settingsRoutes } from '../settings/routes.js';
 import { workspaceRoutes } from '../workspaces/routes.js';
 import { agentRoutes } from '../agents/routes.js';
 import { variableRoutes } from '../variables/routes.js';
+import { terminalRoutes } from '../terminal/routes.js';
+import { awsRoutes } from '../aws/routes.js';
+import { usageRoutes } from '../usage/routes.js';
 import { AgentManager } from '../agents/manager.js';
 import { ClaudeSdkDriver, type AgentDriver } from '../agents/driver.js';
 import { githubRemote, type RemoteResolver } from '../workspaces/service.js';
@@ -57,7 +60,8 @@ export async function buildApp(appDeps: AppDeps): Promise<FastifyInstance> {
       level: config.LOG_LEVEL,
       redact: ['req.headers.cookie', 'req.headers.authorization', 'res.headers["set-cookie"]'],
     },
-    trustProxy: false,
+    // Trust X-Forwarded-For only from the configured number of reverse proxies in front of us.
+    trustProxy: config.TRUST_PROXY_HOPS > 0 ? (_address: string, hop: number) => hop < config.TRUST_PROXY_HOPS : false,
     bodyLimit: 6 * 1024 * 1024,
   });
 
@@ -120,7 +124,47 @@ export async function buildApp(appDeps: AppDeps): Promise<FastifyInstance> {
     await workspaceRoutes(api, deps);
     await agentRoutes(api, deps);
     await variableRoutes(api, deps);
+    await terminalRoutes(api, deps);
+    await awsRoutes(api, deps);
+    await usageRoutes(api, deps);
   }, { prefix: '/api' });
+
+  // Production (SERVE_WEB=true): serve the built web app from this origin. Hashed assets are
+  // cached for a year, everything else revalidates, and any other GET outside /api falls back
+  // to index.html so client-side routes survive a reload. /api/* never gets the HTML.
+  if (config.SERVE_WEB) {
+    const [{ default: fastifyStatic }, fs, path, { fileURLToPath }] = await Promise.all([
+      import('@fastify/static'), import('node:fs/promises'), import('node:path'), import('node:url'),
+    ]);
+    // Monaco needs blob: workers and inline styles; the terminal and agent stream use same-origin WebSockets.
+    const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; " +
+      "img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self' data:; frame-ancestors 'none'; " +
+      "base-uri 'self'; form-action 'self'";
+    const root = path.resolve(config.WEB_DIST_DIR ?? fileURLToPath(new URL('../../../web/dist/', import.meta.url)));
+    const index = path.join(root, 'index.html');
+    if (!(await fs.stat(index).catch(() => undefined))?.isFile()) {
+      throw new Error(`SERVE_WEB=true but ${index} does not exist; run \`npm run build\` first`);
+    }
+    await app.register(fastifyStatic, { root, serve: false });
+    app.get('/*', { config: { public: true } }, async (req, reply) => {
+      let pathname: string;
+      try {
+        pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+      } catch {
+        throw HttpError.badRequest('Malformed URL');
+      }
+      if (pathname === '/api' || pathname.startsWith('/api/')) throw HttpError.notFound();
+      reply.header('content-security-policy', csp);
+      const rel = pathname.replace(/^\/+/, '');
+      const file = path.resolve(root, rel);
+      if (!rel.includes('\0') && file.startsWith(root + path.sep) && (await fs.stat(file).catch(() => undefined))?.isFile()) {
+        if (rel.startsWith('assets/')) return reply.sendFile(rel, { maxAge: '1y', immutable: true });
+        return reply.header('cache-control', 'no-cache').sendFile(rel, { cacheControl: false });
+      }
+      if (rel.startsWith('assets/')) throw HttpError.notFound();
+      return reply.header('cache-control', 'no-cache').sendFile('index.html', { cacheControl: false });
+    });
+  }
 
   return app;
 }

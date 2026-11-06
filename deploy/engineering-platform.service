@@ -1,0 +1,52 @@
+# systemd unit for the Engineering Platform (API + built web app on one port).
+# Install: see docs/03-deployment.md
+#   sudo cp deploy/engineering-platform.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now engineering-platform
+#
+# Secrets (DATABASE_URL, VAULT_KEY, ...) live in /etc/engineering-platform/platform.env,
+# owned by root with mode 0640 and group eplatform. Values there override the defaults below.
+
+[Unit]
+Description=Engineering Platform
+Documentation=file:///opt/engineering-platform/docs/03-deployment.md
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target postgresql.service docker.service
+
+[Service]
+Type=simple
+# A dedicated user. It is in the docker group, which is root-equivalent: never use it for anything else.
+User=eplatform
+Group=eplatform
+SupplementaryGroups=docker
+WorkingDirectory=/opt/engineering-platform/apps/api
+
+Environment=NODE_ENV=production
+Environment=SERVE_WEB=true
+Environment=HOST=127.0.0.1
+Environment=PORT=4000
+Environment=WORKSPACE_RUNTIME=docker
+Environment=WORKSPACES_DIR=/var/lib/engineering-platform/workspaces
+Environment=HOME=/var/lib/engineering-platform
+EnvironmentFile=/etc/engineering-platform/platform.env
+
+# Run node directly (not npm) so SIGTERM reaches the server and it shuts down cleanly.
+ExecStart=/usr/bin/node dist/main.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Hardening that still lets the service run git and the docker CLI.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/engineering-platform
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

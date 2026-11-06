@@ -14,6 +14,11 @@ const schema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  /**
+   * Set to the number of reverse proxies in front of the API (e.g. 1 for Caddy or Tailscale
+   * serve) so client IPs, and therefore login rate limits, are per user. 0 = do not trust.
+   */
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   /** Master key for encrypting saved credentials (base64, 32 bytes). Unset = generated into VAULT_KEY_FILE. */
   VAULT_KEY: z.string().optional(),
   VAULT_KEY_FILE: z.string().default('.data/vault.key'),
@@ -27,6 +32,13 @@ const schema = z.object({
   WORKSPACE_PIDS: z.coerce.number().int().positive().default(512),
   AGENT_MAX_TURNS: z.coerce.number().int().positive().default(80),
   AGENT_MAX_BUDGET_USD: z.coerce.number().positive().default(10),
+  /** Production: serve the built web app (apps/web/dist) from this server, with SPA fallback. */
+  SERVE_WEB: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  /** Where the built web app lives. Default: apps/web/dist next to this API. */
+  WEB_DIST_DIR: z.string().optional(),
 });
 
 export type Config = z.infer<typeof schema>;

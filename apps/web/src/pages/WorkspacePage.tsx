@@ -6,9 +6,11 @@ import { FileTree } from '../components/ws/FileTree';
 import { EditorPane, type OpenFile } from '../components/ws/EditorPane';
 import { ChangesPanel } from '../components/ws/ChangesPanel';
 import { ChatPanel } from '../components/ws/ChatPanel';
+import { TerminalPanel } from '../components/ws/TerminalPanel';
 
-type MobileTab = 'files' | 'code' | 'claude' | 'changes';
+type MobileTab = 'files' | 'code' | 'claude' | 'changes' | 'terminal';
 type SideTab = 'files' | 'changes';
+type BottomTab = 'output' | 'terminal';
 
 function useIsCompact() {
   const query = '(max-width: 900px)';
@@ -37,6 +39,7 @@ export default function WorkspacePage() {
   const [filter, setFilter] = useState('');
   const [mobileTab, setMobileTab] = useState<MobileTab>('claude');
   const [sideTab, setSideTab] = useState<SideTab>('files');
+  const [bottomTab, setBottomTab] = useState<BottomTab>('output');
   const [logLines, setLogLines] = useState<string[]>([]);
   const [agentBusy, setAgentBusy] = useState(false);
   const settings = useResource<AgentSettings>('/me/settings');
@@ -204,6 +207,9 @@ export default function WorkspacePage() {
       onChange={(p, v) => setFiles((fs) => fs.map((f) => (f.path === p ? { ...f, value: v } : f)))}
     />
   );
+  // The terminal mounts (and connects) only once its tab is opened, then stays mounted.
+  const terminalShown = compact ? mobileTab === 'terminal' : bottomTab === 'terminal';
+  const terminal = <TerminalPanel key={compact ? 'phone' : 'desktop'} wsId={wsId} active={terminalShown} compact={compact} />;
   const chat = (
     <ChatPanel wsId={wsId} initialSessionId={search.get('session')} defaultModel={settings.data?.defaultModel ?? 'default'} onRunFinished={onRunFinished} onRunningChange={setAgentBusy} />
   );
@@ -228,11 +234,12 @@ export default function WorkspacePage() {
             <div hidden={mobileTab !== 'code'} className="fill">{editor}</div>
             <div hidden={mobileTab !== 'claude'} className="fill">{chat}</div>
             <div hidden={mobileTab !== 'changes'} className="fill">{changes}</div>
+            <div hidden={mobileTab !== 'terminal'} className="fill">{terminal}</div>
           </div>
           <nav className="ide-tabbar" aria-label="Workspace">
-            {(['files', 'code', 'claude', 'changes'] as MobileTab[]).map((t) => (
+            {(['files', 'code', 'claude', 'changes', 'terminal'] as MobileTab[]).map((t) => (
               <button key={t} className={mobileTab === t ? 'on' : ''} onClick={() => setMobileTab(t)} aria-current={mobileTab === t}>
-                {t === 'files' ? 'Files' : t === 'code' ? 'Code' : t === 'claude' ? 'Claude' : `Changes${changeCount ? ` (${changeCount})` : ''}`}
+                {t === 'files' ? 'Files' : t === 'code' ? 'Code' : t === 'claude' ? 'Claude' : t === 'terminal' ? 'Terminal' : `Changes${changeCount ? ` (${changeCount})` : ''}`}
               </button>
             ))}
           </nav>
@@ -250,8 +257,15 @@ export default function WorkspacePage() {
           </aside>
           <main className="ide-main">
             {editor}
-            <div className="ide-log mono" aria-label="Output">
-              {logLines.length ? logLines.map((l, i) => <div key={i}>{l}</div>) : <div className="muted">Git and file output appears here.</div>}
+            <div className={`ide-bottom${bottomTab === 'terminal' ? ' terminal' : ''}`}>
+              <div className="bottom-tabs" role="tablist" aria-label="Bottom panel">
+                <button role="tab" aria-selected={bottomTab === 'output'} className={bottomTab === 'output' ? 'on' : ''} onClick={() => setBottomTab('output')}>Output</button>
+                <button role="tab" aria-selected={bottomTab === 'terminal'} className={bottomTab === 'terminal' ? 'on' : ''} onClick={() => setBottomTab('terminal')}>Terminal</button>
+              </div>
+              <div className="ide-log mono" aria-label="Output" hidden={bottomTab !== 'output'}>
+                {logLines.length ? logLines.map((l, i) => <div key={i}>{l}</div>) : <div className="muted">Git and file output appears here.</div>}
+              </div>
+              <div className="ide-term" hidden={bottomTab !== 'terminal'}>{terminal}</div>
             </div>
           </main>
           <section className="ide-chat">{chat}</section>

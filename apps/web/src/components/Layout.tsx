@@ -16,6 +16,7 @@ export function Layout() {
         <NavLink to="/clients" className={link}>Clients</NavLink>
         {me.user.isOrgAdmin && <NavLink to="/users" className={link}>Developers</NavLink>}
         {me.user.isOrgAdmin && <NavLink to="/audit" className={link}>Audit log</NavLink>}
+        <NavLink to="/usage" className={link}>Usage</NavLink>
         <NavLink to="/settings" className={link}>Claude &amp; GitHub</NavLink>
         <NavLink to="/account" className={link}>Account</NavLink>
         <div className="sidebar-foot">
