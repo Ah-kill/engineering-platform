@@ -14,6 +14,7 @@ import { auditRoutes } from '../audit/routes.js';
 import { settingsRoutes } from '../settings/routes.js';
 import { workspaceRoutes } from '../workspaces/routes.js';
 import { agentRoutes } from '../agents/routes.js';
+import { variableRoutes } from '../variables/routes.js';
 import { AgentManager } from '../agents/manager.js';
 import { ClaudeSdkDriver, type AgentDriver } from '../agents/driver.js';
 import { githubRemote, type RemoteResolver } from '../workspaces/service.js';
@@ -118,6 +119,7 @@ export async function buildApp(appDeps: AppDeps): Promise<FastifyInstance> {
     await settingsRoutes(api, deps);
     await workspaceRoutes(api, deps);
     await agentRoutes(api, deps);
+    await variableRoutes(api, deps);
   }, { prefix: '/api' });
 
   return app;

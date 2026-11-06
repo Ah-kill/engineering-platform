@@ -9,7 +9,7 @@ import { assertBranch, runGit } from '../git/git.js';
 import { readCredential } from '../settings/credentials.js';
 import type { Vault } from '../vault/vault.js';
 import { workspacePaths } from './paths.js';
-import { separateGitDir, type WorkspaceRuntime } from './runtime.js';
+import { separateGitDir, type NetworkPolicy, type WorkspaceRuntime } from './runtime.js';
 
 export interface WorkspaceRow {
   id: string;
@@ -32,6 +32,8 @@ export interface WorkspaceRow {
   clientName: string;
   environmentName: string;
   environmentKind: string;
+  egressMode: 'restricted' | 'open';
+  egressHosts: string[];
 }
 
 const WS_SELECT = `
@@ -40,7 +42,8 @@ const WS_SELECT = `
          w.state, w.error, w.created_at AS "createdAt", w.last_active_at AS "lastActiveAt",
          r.owner AS "repoOwner", r.name AS "repoName", r.default_branch AS "defaultBranch",
          a.name AS "applicationName", a.client_id AS "clientId", c.name AS "clientName",
-         e.name AS "environmentName", e.kind AS "environmentKind"
+         e.name AS "environmentName", e.kind AS "environmentKind",
+         a.egress_mode AS "egressMode", a.egress_hosts AS "egressHosts"
     FROM workspaces w
     JOIN repositories r ON r.id = w.repository_id
     JOIN applications a ON a.id = w.application_id
@@ -96,6 +99,7 @@ export async function provisionWorkspace(
     baseBranch: string;
     createBranch: boolean;
     runtime: WorkspaceRuntime;
+    network: NetworkPolicy;
   },
 ): Promise<void> {
   const paths = workspacePaths(opts.workspacesDir, opts.workspaceId);
@@ -116,7 +120,7 @@ export async function provisionWorkspace(
       await runGit(['checkout', assertBranch(opts.branch)], { cwd: paths.repo });
     }
     await separateGitDir(paths);
-    await opts.runtime.ensure(paths);
+    await opts.runtime.ensure(paths, opts.network);
     await db.tenant(opts.orgId, (q) => q.query(`UPDATE workspaces SET state = 'ready', error = NULL WHERE id = $1`, [opts.workspaceId]));
   } catch (err) {
     await opts.runtime.remove(opts.workspaceId).catch(() => undefined);

@@ -117,6 +117,68 @@ describe('settings and credentials', () => {
   });
 });
 
+const SECRET_VALUE = 'sk_test_' + 'z'.repeat(24) + 'TAIL';
+
+describe('environment variables and network policy', () => {
+  it('only app admins (or org admins) can set variables; developers can read names', async () => {
+    expect((await dev.request('PUT', `/api/environments/${devEnvId}/variables/API_BASE_URL`, { value: 'https://api.example.com', isSecret: false })).statusCode).toBe(403);
+    const r = await admin.request('PUT', `/api/environments/${devEnvId}/variables/API_BASE_URL`, { value: 'https://api.example.com', isSecret: false, description: 'Partner API' });
+    expect(r.statusCode).toBe(200);
+    expect((await admin.request('PUT', `/api/environments/${devEnvId}/variables/PAYMENT_SECRET`, { value: SECRET_VALUE, isSecret: true })).statusCode).toBe(200);
+
+    const list = (await dev.get(`/api/environments/${devEnvId}/variables`)).json() as { name: string; value: string | null; isSecret: boolean; hint: string }[];
+    expect(list.find((v) => v.name === 'API_BASE_URL')).toMatchObject({ value: 'https://api.example.com', isSecret: false });
+    expect(list.find((v) => v.name === 'PAYMENT_SECRET')).toMatchObject({ value: null, isSecret: true, hint: '…TAIL' });
+  });
+
+  it('never returns or stores a secret in plain text, and never audits values', async () => {
+    const body = (await admin.get(`/api/environments/${devEnvId}/variables`)).body;
+    expect(body).not.toContain(SECRET_VALUE);
+    const rows = await env.db.system((q) => q.query<{ value: string | null; ciphertext: string | null }>("SELECT value, ciphertext FROM environment_variables WHERE name = 'PAYMENT_SECRET'"));
+    expect(rows[0]!.value).toBeNull();
+    expect(rows[0]!.ciphertext).not.toContain(SECRET_VALUE);
+    const audit = await env.db.system((q) => q.query("SELECT details::text AS d FROM audit_events WHERE action LIKE 'variable.%'"));
+    expect(JSON.stringify(audit)).not.toContain(SECRET_VALUE);
+  });
+
+  it('rejects reserved and malformed names', async () => {
+    for (const name of ['PATH', 'CLAUDE_CODE_OAUTH_TOKEN', 'HTTPS_PROXY', 'lower']) {
+      expect((await admin.request('PUT', `/api/environments/${devEnvId}/variables/${name}`, { value: 'x' })).statusCode, name).toBe(400);
+    }
+  });
+
+  it('imports a .env file as secrets', async () => {
+    const r = await admin.post(`/api/environments/${devEnvId}/variables/import`, { text: 'export WEBHOOK_TOKEN=abc123def456\nREGION=eu-west-1\n', isSecret: true });
+    expect(r.statusCode).toBe(200);
+    const names = (r.json() as { name: string; isSecret: boolean }[]).filter((v) => ['WEBHOOK_TOKEN', 'REGION'].includes(v.name));
+    expect(names.every((v) => v.isSecret)).toBe(true);
+    await admin.delete(`/api/environments/${devEnvId}/variables/WEBHOOK_TOKEN`);
+    await admin.delete(`/api/environments/${devEnvId}/variables/REGION`);
+  });
+
+  it('production variables can only be changed by an org admin', async () => {
+    const lead = (await admin.get('/api/users')).json() as { id: string; email: string }[];
+    const devId = lead.find((u) => u.email === 'dev@acme.test')!.id;
+    await admin.post('/api/grants', { userId: devId, role: 'app_admin', scopeType: 'application', scopeId: appId });
+    expect((await dev.request('PUT', `/api/environments/${prodEnvId}/variables/LIVE_KEY`, { value: 'x' })).statusCode).toBe(403);
+    expect((await dev.request('PUT', `/api/environments/${devEnvId}/variables/DEV_ONLY`, { value: 'x', isSecret: false })).statusCode).toBe(200);
+    await dev.delete(`/api/environments/${devEnvId}/variables/DEV_ONLY`);
+    expect((await admin.request('PUT', `/api/environments/${prodEnvId}/variables/LIVE_KEY`, { value: 'x' })).statusCode).toBe(200);
+    const grants = (await admin.get(`/api/grants?scopeType=application&scopeId=${appId}`)).json() as { id: string; userId: string; role: string }[];
+    await admin.delete(`/api/grants/${grants.find((g) => g.userId === devId && g.role === 'app_admin')!.id}`);
+  });
+
+  it('stores the network policy and validates host names', async () => {
+    const before = (await dev.get(`/api/applications/${appId}/network`)).json();
+    expect(before).toMatchObject({ mode: 'restricted', hosts: [] });
+    expect(before.builtin).toContain('api.anthropic.com');
+    expect((await dev.request('PUT', `/api/applications/${appId}/network`, { mode: 'open', hosts: [] })).statusCode).toBe(403);
+    expect((await admin.request('PUT', `/api/applications/${appId}/network`, { mode: 'restricted', hosts: ['https://bad'] })).statusCode).toBe(400);
+    const r = await admin.request('PUT', `/api/applications/${appId}/network`, { mode: 'restricted', hosts: ['api.example.com', '*.example.org', 'API.EXAMPLE.COM'] });
+    expect(r.json()).toMatchObject({ mode: 'restricted', hosts: ['api.example.com', '*.example.org'] });
+  });
+});
+
 describe('repository and workspace', () => {
   it('only app admins can connect the repository', async () => {
     expect((await dev.request('PUT', `/api/applications/${appId}/repository`, { url: 'https://github.com/abc/payments' })).statusCode).toBe(403);
@@ -234,6 +296,11 @@ describe('agent runs', () => {
     expect(seen!.env.ANTHROPIC_API_KEY).toMatch(/^sk-ant-api03-/);
     expect(seen!.env.CLAUDE_CONFIG_DIR).toMatch(/home[\\/]\.claude$/);
     expect(seen!.model).toBe('default');
+    // The environment's variables reach Claude and the commands it runs, names in the prompt.
+    expect(seen!.env.API_BASE_URL).toBe('https://api.example.com');
+    expect(seen!.env.PAYMENT_SECRET).toBe(SECRET_VALUE);
+    expect(seen!.appendSystemPrompt).toContain('API_BASE_URL, PAYMENT_SECRET');
+    expect(seen!.appendSystemPrompt).not.toContain(SECRET_VALUE);
 
     const sessions = (await dev.get(`/api/workspaces/${wsId}/agent/sessions`)).json();
     expect(sessions.sessions[0]).toMatchObject({ costUsd: 0.05, inputTokens: 100, outputTokens: 20 });
@@ -301,6 +368,16 @@ describe('agent runs', () => {
     const evs = await waitIdle(sessionId);
     expect(JSON.stringify(evs)).not.toMatch(/sk-ant-api03-a{10}/);
     expect(evs.find((e) => e.kind === 'text')?.data.text).toBe('oops [redacted]');
+  });
+
+  it('redacts environment secrets from anything Claude prints', async () => {
+    script = async function* (input) {
+      yield { kind: 'tool_result', toolUseId: 't', isError: false, output: `PAYMENT_SECRET=${input.env.PAYMENT_SECRET}` };
+    };
+    const { sessionId } = (await dev.post(`/api/workspaces/${wsId}/agent/run`, { prompt: 'print env', mode: 'execute' })).json();
+    const evs = await waitIdle(sessionId);
+    expect(JSON.stringify(evs)).not.toContain(SECRET_VALUE);
+    expect(evs.find((e) => e.kind === 'tool_result')?.data.output).toBe('PAYMENT_SECRET=[redacted]');
   });
 
   it('needs a credential for the chosen mode', async () => {

@@ -18,12 +18,16 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
 # container, so trust it (otherwise git refuses with "dubious ownership").
 RUN git config --system --add safe.directory /ws/repo  && git config --system --add safe.directory /ws/git
 
+# Outbound filter used in restricted network mode (runs in its own small container).
+COPY egress-proxy.mjs /opt/platform/egress-proxy.mjs
+
 # Unprivileged user (uid 1000 from the node image). /home/agent is a per-workspace volume.
 RUN mkdir -p /home/agent /ws/repo /ws/git && chown -R node:node /home/agent /ws
 USER node
 ENV HOME=/home/agent \
     CLAUDE_CONFIG_DIR=/home/agent/.claude \
     DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     npm_config_update_notifier=false
 WORKDIR /ws/repo
 

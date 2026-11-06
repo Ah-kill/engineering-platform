@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ClaudeSdkDriver, type AgentEvent } from '../src/agents/driver.js';
 import { readSdkPackage } from '../src/agents/version.js';
 import { runGit } from '../src/git/git.js';
-import { DockerRuntime, separateGitDir, type WorkspaceDirs } from '../src/workspaces/runtime.js';
+import { defaultImage, DockerRuntime, separateGitDir, type WorkspaceDirs } from '../src/workspaces/runtime.js';
 
 /**
  * Proves the container boundary with the real Docker engine and the real Claude Code
@@ -31,7 +31,7 @@ describe.skipIf(!dockerUp)('Docker workspace runtime', () => {
 
   beforeAll(async () => {
     const sdk = await readSdkPackage();
-    runtime = new DockerRuntime({ image: `engineering-platform-workspace:${sdk.claudeCodeVersion}`, claudeCodeVersion: sdk.claudeCodeVersion!, cpus: '1', memory: '1g', pidsLimit: 256 });
+    runtime = new DockerRuntime({ image: defaultImage(sdk.claudeCodeVersion!), claudeCodeVersion: sdk.claudeCodeVersion!, cpus: '1', memory: '1g', pidsLimit: 256 });
     tmp = await mkdtemp(path.join(os.tmpdir(), 'ep-docker-'));
     const bare = path.join(tmp, 'origin.git');
     await runGit(['init', '--bare', '-b', 'main', bare], { cwd: tmp });
@@ -96,6 +96,41 @@ describe.skipIf(!dockerUp)('Docker workspace runtime', () => {
     expect(Number(await sleepers())).toBe(before);
     expect(await readFile(path.join(dirs.repo, 'created.txt'), 'utf8')).toContain('from-container'); // files survive
   }, 60_000);
+
+  describe('network policy', () => {
+    const code = (url: string, extra = '') => exec(name, `curl -sS ${extra} -o /dev/null -m 20 -w '%{http_code}' ${url}`);
+
+    it('restricted (default): built-in hosts work through the filter, everything else is blocked', async () => {
+      const anthropic = await code('https://api.anthropic.com/');
+      expect(anthropic.code, anthropic.out).toBe(0);
+      expect(anthropic.out).toMatch(/^\d{3}$/);
+
+      const other = await code('https://example.com/');
+      expect(other.code).not.toBe(0);
+      expect(other.out).toMatch(/403/);
+      expect((await exec(name, 'curl -sS -m 20 http://example.com/')).out).toContain('Blocked by workspace network policy');
+
+      // Bypassing the proxy goes nowhere: the workspace network has no route out.
+      expect((await code('https://api.anthropic.com/', "--noproxy '*'")).code).not.toBe(0);
+    }, 120_000);
+
+    it('allowing a host takes effect (container rebuilt, files kept)', async () => {
+      await runtime.ensure(dirs, { mode: 'restricted', hosts: ['example.com'] });
+      const r = await code('https://example.com/');
+      expect(r.code, r.out).toBe(0);
+      expect(r.out).toBe('200');
+      expect((await code('https://www.iana.org/')).code).not.toBe(0); // still not listed
+      expect(await readFile(path.join(dirs.repo, 'created.txt'), 'utf8')).toContain('from-container');
+    }, 180_000);
+
+    it('open mode: unrestricted, no proxy', async () => {
+      await runtime.ensure(dirs, { mode: 'open', hosts: [] });
+      expect((await exec(name, 'echo "${HTTPS_PROXY:-none}"')).out).toBe('none');
+      const r = await code('https://example.com/');
+      expect(r.out).toBe('200');
+      await runtime.ensure(dirs, { mode: 'restricted', hosts: [] }); // back to default for the next test
+    }, 180_000);
+  });
 
   it('runs Claude Code itself inside the container', async () => {
     const events: AgentEvent[] = [];

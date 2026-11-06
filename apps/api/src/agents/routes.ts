@@ -11,6 +11,7 @@ import { workspacePaths } from '../workspaces/paths.js';
 import { agentEnv } from './driver.js';
 import { listModels } from './models.js';
 import { claudeCodeVersions } from './version.js';
+import { resolveVariables } from '../variables/variables.js';
 import path from 'node:path';
 
 const idParam = z.object({ id: z.string().uuid() });
@@ -121,7 +122,8 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
       const ws = await loadWorkspace(q, user, id);
       const settings = await readAgentSettings(q, user.id);
       const auth = await claudeAuthEnv(q, vault, user.id);
-      return { ws, model: body.model ?? settings.defaultModel, auth };
+      const vars = await resolveVariables(q, vault, ws.environmentId);
+      return { ws, model: body.model ?? settings.defaultModel, auth, vars };
     });
     const paths = workspacePaths(workspacesDir, id);
     return agents.start(
@@ -138,6 +140,9 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
         labels: { client: ctx.ws.clientName, application: ctx.ws.applicationName, environment: ctx.ws.environmentName, branch: ctx.ws.branch },
         authEnv: ctx.auth.env,
         authMode: ctx.auth.mode,
+        appEnv: ctx.vars.env,
+        appSecrets: ctx.vars.secretValues,
+        network: { mode: ctx.ws.egressMode, hosts: ctx.ws.egressHosts },
       },
       { prompt: body.prompt, mode: body.mode, model: ctx.model, sessionId: body.sessionId },
     );

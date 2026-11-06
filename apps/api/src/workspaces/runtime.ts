@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -18,14 +19,38 @@ export interface WorkspaceRuntime {
   readonly kind: 'docker' | 'local';
   /** The checkout's path as Claude sees it. */
   readonly repoPathForAgent: (hostRepo: string) => string;
-  /** Creates or starts the workspace's container. */
-  ensure(ws: WorkspaceDirs): Promise<void>;
+  /**
+   * Creates or starts the workspace's container with the application's network policy.
+   * A changed policy recreates the container (files live on the mounts and are kept).
+   */
+  ensure(ws: WorkspaceDirs, network?: NetworkPolicy): Promise<void>;
   /** Kills every process the agent left behind (between runs). */
   recycle(workspaceId: string): Promise<void>;
   remove(workspaceId: string): Promise<void>;
   /** Spawns Claude Code inside the workspace, or undefined to spawn on the host. */
   spawnClaude?(workspaceId: string, options: SpawnOptions): SpawnedProcess;
 }
+
+export interface NetworkPolicy {
+  /** restricted: only built-in and listed hosts. open: unrestricted internet. */
+  mode: 'restricted' | 'open';
+  hosts: string[];
+}
+
+/** Always reachable in restricted mode: Claude itself, GitHub and the main package registries. */
+export const BUILTIN_HOSTS = [
+  'api.anthropic.com',
+  'github.com',
+  'codeload.github.com',
+  '*.githubusercontent.com',
+  'registry.npmjs.org',
+  'registry.yarnpkg.com',
+  'pypi.org',
+  'files.pythonhosted.org',
+];
+
+/** host, *.host or host:port; lowercase DNS names only (no IPs, no URLs). */
+export const HOST_RULE = /^(\*\.)?(?=.{1,253}(:|$))([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(:\d{1,5})?$/;
 
 export interface WorkspaceDirs {
   id: string;
@@ -63,6 +88,20 @@ export async function separateGitDir(ws: WorkspaceDirs): Promise<void> {
 }
 
 const CONTAINER_REPO = '/ws/repo';
+
+/** Variables that describe the host machine and must not be copied into a container. */
+const HOST_ONLY_ENV = new Set([
+  'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'APPDATA',
+  'LOCALAPPDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'COMMONPROGRAMFILES', 'LANG', 'TERM',
+  'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_GIT_BASH_PATH',
+]);
+
+/** Bump when apps/runtime changes, so a fresh image is built instead of reusing an old one. */
+export const RUNTIME_REVISION = 'r3';
+
+export function defaultImage(claudeCodeVersion: string): string {
+  return `engineering-platform-workspace:${claudeCodeVersion}-${RUNTIME_REVISION}`;
+}
 const RUNTIME_DIR = fileURLToPath(new URL('../../../runtime/', import.meta.url));
 
 function run(args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
@@ -121,23 +160,74 @@ export class DockerRuntime implements WorkspaceRuntime {
     return this.imageReady;
   }
 
-  async ensure(ws: WorkspaceDirs): Promise<void> {
+  static proxyName(workspaceId: string) {
+    return `ep-px-${workspaceId}`;
+  }
+
+  static networkName(workspaceId: string) {
+    return `ep-net-${workspaceId}`;
+  }
+
+  private static policyHash(policy: NetworkPolicy): string {
+    const hosts = policy.mode === 'restricted' ? [...BUILTIN_HOSTS, ...policy.hosts].map((h) => h.toLowerCase()).sort() : [];
+    return createHash('sha256').update(`${policy.mode}|${hosts.join(',')}|${RUNTIME_REVISION}`).digest('hex').slice(0, 16);
+  }
+
+  async ensure(ws: WorkspaceDirs, network: NetworkPolicy = { mode: 'restricted', hosts: [] }): Promise<void> {
     if (!(await DockerRuntime.available())) {
       throw new HttpError(503, 'runtime_unavailable', 'Docker is not running. Start Docker Desktop and try again.');
     }
     await separateGitDir(ws);
     const name = DockerRuntime.containerName(ws.id);
-    const state = await run(['container', 'inspect', '--format', '{{.State.Status}}', name]).then((s) => s.trim(), () => null);
-    if (state === 'running') return;
-    if (state) {
-      await run(['start', name]);
+    const proxy = DockerRuntime.proxyName(ws.id);
+    const hash = DockerRuntime.policyHash(network);
+
+    const inspect = await run(['container', 'inspect', '--format', '{{.State.Status}} {{index .Config.Labels "engineering-platform.policy"}}', name])
+      .then((s) => s.trim().split(' '), () => null);
+    if (inspect && inspect[1] !== hash) {
+      // Policy changed: rebuild the container and its network setup around the same files.
+      await this.remove(ws.id);
+    } else if (inspect) {
+      if (network.mode === 'restricted') await run(['start', proxy]).catch(() => undefined);
+      if (inspect[0] !== 'running') await run(['start', name]);
       return;
     }
+
     await this.ensureImage();
+    const netArgs: string[] = [];
+    if (network.mode === 'restricted') {
+      const net = DockerRuntime.networkName(ws.id);
+      // --internal: no route to the outside world; the proxy is the only exit.
+      await run(['network', 'create', '--internal', '--label', `engineering-platform.workspace=${ws.id}`, net]).catch(() => undefined);
+      await run(['rm', '-f', proxy]).catch(() => undefined);
+      await run([
+        'run', '-d',
+        '--name', proxy,
+        '--label', `engineering-platform.workspace=${ws.id}`,
+        '--restart', 'unless-stopped',
+        '--user', '1000:1000',
+        '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges',
+        '--read-only',
+        '--memory', '256m',
+        '--pids-limit', '64',
+        '-e', `ALLOW_HOSTS=${[...BUILTIN_HOSTS, ...network.hosts].join(',')}`,
+        '-e', 'PORT=3128',
+        this.opts.image,
+        'node', '/opt/platform/egress-proxy.mjs',
+      ]);
+      await run(['network', 'connect', net, proxy]);
+      const proxyUrl = `http://${proxy}:3128`;
+      netArgs.push('--network', net);
+      for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) netArgs.push('-e', `${k}=${proxyUrl}`);
+      netArgs.push('-e', 'NO_PROXY=localhost,127.0.0.1', '-e', 'no_proxy=localhost,127.0.0.1', '-e', 'NODE_USE_ENV_PROXY=1');
+    }
+
     await run([
       'run', '-d',
       '--name', name,
       '--label', 'engineering-platform.workspace=' + ws.id,
+      '--label', 'engineering-platform.policy=' + hash,
       '--init',
       '--user', '1000:1000',
       '--cap-drop', 'ALL',
@@ -156,6 +246,7 @@ export class DockerRuntime implements WorkspaceRuntime {
       '--add-host', 'host.docker.internal=::1',
       '--add-host', 'gateway.docker.internal=127.0.0.1',
       '--add-host', 'gateway.docker.internal=::1',
+      ...netArgs,
       '--workdir', CONTAINER_REPO,
       this.opts.image,
     ]);
@@ -168,17 +259,18 @@ export class DockerRuntime implements WorkspaceRuntime {
   }
 
   async remove(workspaceId: string): Promise<void> {
-    await run(['rm', '-f', DockerRuntime.containerName(workspaceId)]).catch(() => undefined);
+    await run(['rm', '-f', DockerRuntime.containerName(workspaceId), DockerRuntime.proxyName(workspaceId)]).catch(() => undefined);
+    await run(['network', 'rm', DockerRuntime.networkName(workspaceId)]).catch(() => undefined);
   }
 
   spawnClaude(workspaceId: string, options: SpawnOptions): SpawnedProcess {
-    // Forward only what Claude Code needs: its own CLAUDE_*/ANTHROPIC_* settings and the
-    // developer's credential. Values travel via the docker client's environment
-    // (`-e NAME` with no value), so they never appear on a command line.
+    // Forward Claude Code's own settings, the developer's credential and the environment's
+    // variables, but nothing describing the host. Values travel via the docker client's
+    // environment (`-e NAME` with no value), so they never appear on a command line.
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(options.env)) {
-      if (v === undefined) continue;
-      if (/^(ANTHROPIC_|CLAUDE_|DISABLE_|MCP_)/.test(k) && k !== 'CLAUDE_CONFIG_DIR') env[k] = v;
+      if (v === undefined || HOST_ONLY_ENV.has(k.toUpperCase())) continue;
+      env[k] = v;
     }
     // The SDK may hand us "<runtime> <script> ...flags"; inside the container `claude` is on PATH.
     const base = path.basename(options.command).toLowerCase().replace(/\.exe$/, '');

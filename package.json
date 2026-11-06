@@ -15,7 +15,7 @@
     "update:claude": "npm install @anthropic-ai/claude-agent-sdk@latest --workspace apps/api && npm run runtime:build && npm test --workspace apps/api",
     "test:e2e": "playwright test",
     "test:e2e:report": "playwright show-report e2e-report",
-    "runtime:build": "node -e \"const v=require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').claudeCodeVersion;require('child_process').execFileSync('docker',['build','--build-arg','CLAUDE_CODE_VERSION='+v,'-t','engineering-platform-workspace:'+v,'apps/runtime'],{stdio:'inherit'})\""
+    "runtime:build": "npm run runtime:build --workspace apps/api"
   },
   "overrides": {
     "monaco-editor": {

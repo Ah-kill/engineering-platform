@@ -107,8 +107,9 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
       if (!(await authorize(q, principal, 'environment.use', { type: 'environment', id: body.environmentId })).allowed) {
         throw HttpError.forbidden('You do not have working access to this environment');
       }
-      const [repo] = await q.query<{ id: string; owner: string; name: string; default_branch: string }>(
-        'SELECT id, owner, name, default_branch FROM repositories WHERE application_id = $1',
+      const [repo] = await q.query<{ id: string; owner: string; name: string; default_branch: string; egress_mode: 'restricted' | 'open'; egress_hosts: string[] }>(
+        `SELECT r.id, r.owner, r.name, r.default_branch, a.egress_mode, a.egress_hosts
+           FROM repositories r JOIN applications a ON a.id = r.application_id WHERE r.application_id = $1`,
         [id],
       );
       if (!repo) throw HttpError.badRequest('Connect a repository to this application first');
@@ -140,6 +141,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
       baseBranch: prepared.baseBranch,
       createBranch: body.createBranch,
       runtime,
+      network: { mode: prepared.repo.egress_mode, hosts: prepared.repo.egress_hosts },
     });
     return reply.status(202).send({ id: prepared.workspaceId, state: 'creating' });
   });

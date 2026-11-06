@@ -7,7 +7,7 @@ import { migrate } from './db/migrate.js';
 import { buildApp } from './http/app.js';
 import { Vault } from './vault/vault.js';
 import { readSdkPackage } from './agents/version.js';
-import { DockerRuntime, localRuntime, type WorkspaceRuntime } from './workspaces/runtime.js';
+import { defaultImage, DockerRuntime, localRuntime, type WorkspaceRuntime } from './workspaces/runtime.js';
 
 const config = loadConfig();
 if (!config.DATABASE_URL) await mkdir(config.DATA_DIR, { recursive: true });
@@ -30,7 +30,7 @@ if (config.WORKSPACE_RUNTIME === 'docker') {
   const sdk = await readSdkPackage();
   const claudeCodeVersion = sdk.claudeCodeVersion ?? 'latest';
   runtime = new DockerRuntime({
-    image: config.WORKSPACE_IMAGE ?? `engineering-platform-workspace:${claudeCodeVersion}`,
+    image: config.WORKSPACE_IMAGE ?? defaultImage(claudeCodeVersion),
     claudeCodeVersion,
     cpus: config.WORKSPACE_CPUS,
     memory: config.WORKSPACE_MEMORY,
