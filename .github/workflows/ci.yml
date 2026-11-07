@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: '1'
+  # Keep install logs short.
+  npm_config_fund: 'false'
+
+jobs:
+  check:
+    name: Typecheck, API tests, web build, audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (API and web)
+        run: npm run typecheck
+
+      # GitHub's Ubuntu runners have Docker, so build the workspace image first: the container
+      # tests in apps/api/test/docker.test.ts then run instead of skipping.
+      - name: Build the workspace image
+        run: npm run runtime:build
+
+      - name: Git identity for test repositories
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      - name: API tests
+        run: npm test --workspace apps/api
+
+      - name: Web build
+        run: npm run build --workspace apps/web
+
+      - name: Dependency audit (high and critical)
+        run: npm audit --audit-level=high
+
+  e2e:
+    name: Playwright (desktop and phone)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Git identity for the seeded repository
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      # The isolated stack (apps/api/e2e/server.ts) uses a fresh database, a local git
+      # repository and a scripted agent: no credentials, no network calls to Claude or GitHub.
+      - name: End-to-end tests
+        run: npm run test:e2e
+        env:
+          CI: 'true'
+
+      - name: Upload the Playwright report
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-report
+          path: |
+            e2e-report/
+            test-results/
+          retention-days: 14
+          if-no-files-found: ignore

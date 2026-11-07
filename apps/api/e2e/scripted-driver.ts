@@ -8,12 +8,30 @@ import type { AgentDriver, AgentEvent, AgentRunInput } from '../src/agents/drive
  *
  * - plan mode: reads a file, then proposes a plan via ExitPlanMode
  * - execute mode: edits src/retry.js; if the prompt mentions "clean", first asks to run `rm -rf build`
+ * - "project instructions": echoes the application's project instructions from the system prompt
+ * - "deploy" (execute): asks to run `terraform apply`, which always needs approval
  */
 export class ScriptedDriver implements AgentDriver {
   async *run(input: AgentRunInput): AsyncIterable<AgentEvent> {
     const signal = input.abortController.signal;
     const opts = { signal } as Parameters<AgentRunInput['canUseTool']>[2];
     yield { kind: 'session', sdkSessionId: `scripted-${Date.now()}` };
+
+    if (/project instructions/i.test(input.prompt)) {
+      // Reports the project instructions it received in the system prompt.
+      const m = /<project-instructions>\n([\s\S]*?)\n<\/project-instructions>/.exec(input.appendSystemPrompt);
+      yield { kind: 'text', text: m ? `Project instructions: ${m[1]}` : 'No project instructions.' };
+      yield { kind: 'result', isError: false, subtype: 'success', costUsd: 0.001, inputTokens: 10, outputTokens: 5, durationMs: 100, text: 'Done' };
+      return;
+    }
+
+    if (/deploy/i.test(input.prompt) && input.mode === 'execute') {
+      // A high-risk command: the platform asks the developer, with the reason.
+      const decision = await input.canUseTool('Bash', { command: 'terraform -chdir=infra apply -auto-approve' }, opts);
+      yield { kind: 'text', text: decision.behavior === 'allow' ? 'Applied the infrastructure change.' : 'Did not deploy.' };
+      yield { kind: 'result', isError: false, subtype: 'success', costUsd: 0.002, inputTokens: 20, outputTokens: 8, durationMs: 200, text: 'Done' };
+      return;
+    }
 
     if (/environment variables/i.test(input.prompt)) {
       // Reports what the platform gave it, and (deliberately) tries to print a secret value.

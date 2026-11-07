@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useResource } from '../hooks';
+import { MyBudget } from '../components/MyBudget';
 
 // ---- API shape (GET /api/usage) ---------------------------------------------
 
@@ -81,6 +82,7 @@ export function UsagePage() {
         </label>
       </div>
 
+      <MyBudget />
       {(invalid ?? error) && <div className="error" role="alert">{invalid ?? error?.message}</div>}
       {!data && loading && !invalid && <p className="muted">Loading…</p>}
 

@@ -261,7 +261,10 @@ describe.skipIf(!dockerUp)('terminal in a Docker workspace', () => {
       expect(await t.run('echo $HOME', /^\/home\/agent$/m)).toBe('/home/agent');
       expect(await t.run('pwd', /^\/ws\/repo$/m)).toBe('/ws/repo');
       expect(await t.run('id -u', /^\d+$/m)).toBe('1000');
-      expect(await t.run('echo "$GREETING"', /^hello from the environment$/m)).toBeTruthy();
+      // The secret reaches the shell (26 characters + newline) but its value is redacted from the output.
+      expect(await t.run('printf %s "$GREETING" | wc -c', /^\d+$/m)).toBe('26');
+      expect(await t.run('echo "v=$GREETING"', /^v=\S+$/m)).toBe('v=[redacted]');
+      expect(t.text()).not.toContain('hello from the environment');
       expect(await t.run('echo "$TERM"', /^xterm-256color$/m)).toBeTruthy();
       expect(await t.run('tty', /^\/dev\/pts\/\d+$/m)).toMatch(/pts/);
 

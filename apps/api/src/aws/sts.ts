@@ -18,6 +18,11 @@ export interface AssumeRoleParams {
   sessionName: string;
   durationSeconds: number;
   region: string;
+  /**
+   * Inline session policy (JSON). The session gets the intersection of the role's permissions
+   * and this policy, so it can only narrow access. Omitted = the role's permissions as they are.
+   */
+  policy?: string;
 }
 
 export interface AwsTemporaryCredentials {
@@ -65,6 +70,7 @@ export class AwsSdkSts implements StsClient {
         RoleSessionName: p.sessionName,
         ExternalId: p.externalId,
         DurationSeconds: p.durationSeconds,
+        ...(p.policy ? { Policy: p.policy } : {}),
       }),
     );
     const c = out.Credentials;
@@ -132,9 +138,13 @@ export function stsError(err: unknown, region: string): HttpError {
       return aws(400, `AWS rejected the request: ${message.slice(0, 300) || 'validation error'}`);
     case 'MalformedPolicyDocument':
     case 'MalformedPolicyDocumentException':
+      return aws(400, `AWS rejected the session policy: ${message.slice(0, 300)}`);
     case 'PackedPolicyTooLarge':
     case 'PackedPolicyTooLargeException':
-      return aws(400, `AWS rejected the session policy: ${message.slice(0, 300)}`);
+      return aws(
+        400,
+        'AWS says the session policy is too large once packed into the session token. Use fewer allowed actions or combine them with wildcards (for example lambda:Get*).',
+      );
     case 'RegionDisabledException':
       return aws(400, `STS is not activated in ${region} for the platform account. Choose another region or activate it in IAM.`);
     case 'ExpiredToken':

@@ -9,6 +9,23 @@ RUN apt-get update \
       python3 python3-pip python3-venv build-essential \
  && rm -rf /var/lib/apt/lists/*
 
+# AWS CLI v2, official bundle for this image's architecture (x86_64 or aarch64). It reads the
+# short-lived AWS_* variables the platform injects; no credentials are baked into the image.
+# groff-base lets `aws help` render; unzip is only needed during the install and is removed again.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in x86_64|aarch64) ;; *) echo "Unsupported architecture for AWS CLI v2: $arch" >&2; exit 1 ;; esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends unzip groff-base; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL --proto '=https' --tlsv1.2 "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" -o "$tmp/awscliv2.zip"; \
+    unzip -q "$tmp/awscliv2.zip" -d "$tmp"; \
+    "$tmp/aws/install" --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin; \
+    rm -rf "$tmp"; \
+    apt-get purge -y --auto-remove unzip; \
+    rm -rf /var/lib/apt/lists/*; \
+    aws --version
+
 # Same Claude Code version as the Agent SDK in apps/api (see package.json claudeCodeVersion).
 ARG CLAUDE_CODE_VERSION=2.1.318
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \

@@ -36,6 +36,7 @@ export function AccountPage() {
         <button className="primary" disabled={action.pending}>Change password</button>
       </form>
       <TwoStepLogin />
+      <SignedInDevices />
     </div>
   );
 }
@@ -233,5 +234,106 @@ function DisableForm({ onDone }: { onDone(): Promise<void> }) {
         <button type="button" onClick={() => { setOpen(false); action.clearError(); }}>Cancel</button>
       </div>
     </form>
+  );
+}
+
+// ---- signed-in devices ----------------------------------------------------------
+
+interface SignedInSession {
+  id: string; createdAt: string; lastUsedAt: string; expiresAt: string;
+  ip: string | null; userAgent: string | null; current: boolean;
+}
+
+/** "Chrome on Windows" from a user-agent string; good enough to recognise a device. */
+function deviceName(ua: string | null): string {
+  if (!ua) return 'Unknown device';
+  const browser =
+    /Edg\//.test(ua) ? 'Edge'
+    : /OPR\/|Opera/.test(ua) ? 'Opera'
+    : /Firefox\/|FxiOS/.test(ua) ? 'Firefox'
+    : /Chrome\/|CriOS/.test(ua) ? 'Chrome'
+    : /Safari\//.test(ua) ? 'Safari'
+    : /curl|node|undici|lightMyRequest/i.test(ua) ? 'Script'
+    : 'Browser';
+  const os =
+    /iPhone|iPad|iPod/.test(ua) ? 'iOS'
+    : /Android/.test(ua) ? 'Android'
+    : /Windows/.test(ua) ? 'Windows'
+    : /Mac OS X|Macintosh/.test(ua) ? 'macOS'
+    : /CrOS/.test(ua) ? 'ChromeOS'
+    : /Linux/.test(ua) ? 'Linux'
+    : '';
+  return os ? `${browser} on ${os}` : browser;
+}
+
+/** The user's own active sessions, with sign-out per device and everywhere else. */
+function SignedInDevices() {
+  const { refresh } = useAuth();
+  const sessions = useResource<SignedInSession[]>('/me/sessions');
+  const [notice, setNotice] = useState<string | undefined>();
+
+  const revoke = useAction(async (s: SignedInSession) => {
+    setNotice(undefined);
+    const res = await api<{ signedOut: boolean }>('DELETE', `/me/sessions/${s.id}`);
+    if (res.signedOut) {
+      await refresh(); // this device is signed out: back to the sign-in page
+      return;
+    }
+    setNotice(`Signed out ${deviceName(s.userAgent)}.`);
+    await sessions.reload();
+  });
+  const revokeOthers = useAction(async () => {
+    setNotice(undefined);
+    const res = await api<{ revoked: number }>('POST', '/me/sessions/revoke-others');
+    setNotice(res.revoked === 1 ? 'Signed out 1 other device.' : `Signed out ${res.revoked} other devices.`);
+    await sessions.reload();
+  });
+
+  const list = sessions.data ?? [];
+  const others = list.filter((s) => !s.current).length;
+  const error = sessions.error?.message ?? revoke.error ?? revokeOthers.error;
+
+  return (
+    <section className="card form" aria-labelledby="devices-title">
+      <h2 id="devices-title" style={{ margin: 0 }}>Signed-in devices</h2>
+      <p className="muted" style={{ margin: 0 }}>
+        Where your account is signed in now. Sign out anything you do not recognise, then change your password.
+      </p>
+      {notice && <div className="badge ok mfa-notice" role="status">{notice}</div>}
+      {error && <div className="error" role="alert">{error}</div>}
+      {sessions.loading && !sessions.data && <div className="muted">Loading…</div>}
+      <ul className="device-list">
+        {list.map((s) => (
+          <li key={s.id} className="device">
+            <div className="device-info">
+              <div className="device-name">
+                {deviceName(s.userAgent)}
+                {s.current && <span className="badge ok">This device</span>}
+              </div>
+              <div className="muted device-meta">
+                {s.ip ? `${s.ip} · ` : ''}signed in {new Date(s.createdAt).toLocaleString()}
+                {s.lastUsedAt !== s.createdAt && <> · last used {new Date(s.lastUsedAt).toLocaleString()}</>}
+              </div>
+            </div>
+            <button
+              type="button"
+              className={s.current ? 'small' : 'small danger'}
+              disabled={revoke.pending}
+              aria-label={s.current ? 'Sign out this device' : `Sign out ${deviceName(s.userAgent)}, signed in ${new Date(s.createdAt).toLocaleString()}`}
+              onClick={() => void revoke.run(s)}
+            >
+              Sign out
+            </button>
+          </li>
+        ))}
+      </ul>
+      {others > 0 && (
+        <div>
+          <button type="button" className="danger" disabled={revokeOthers.pending} onClick={() => void revokeOthers.run()}>
+            Sign out all other devices
+          </button>
+        </div>
+      )}
+    </section>
   );
 }

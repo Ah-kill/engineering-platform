@@ -114,3 +114,53 @@ export interface AuditRow {
   id: string; occurredAt: string; action: string; outcome: string; actorEmail: string | null;
   resourceType: string | null; resourceId: string | null; details: Record<string, unknown>;
 }
+
+// ---- git and workspace features --------------------------------------------
+
+export interface GithubTokenInfo { owner: string | null; hint: string; updatedAt: string }
+export interface SettingsWithGithub extends AgentSettings { githubTokens: GithubTokenInfo[] }
+
+export interface GithubRepoSummary {
+  owner: string; name: string; fullName: string; private: boolean; defaultBranch: string;
+  description: string; updatedAt: string; url: string;
+}
+
+export type WorkspaceRole = 'owner' | 'editor' | 'viewer';
+export interface SharedWorkspace extends Workspace { access: WorkspaceRole; ownerName: string; ownerId: string }
+
+export interface WorkspaceMember { userId: string; displayName: string; email: string; role: 'viewer' | 'editor'; createdAt: string }
+export interface WorkspaceMembers { owner: { id: string; displayName: string; email: string }; members: WorkspaceMember[]; canManage: boolean }
+export interface ShareCandidate { id: string; displayName: string; email: string }
+
+export interface CommitSummary { sha: string; author: string; date: string; subject: string }
+
+export interface FileVersions {
+  path: string; oldPath?: string; status: 'added' | 'modified' | 'deleted' | 'renamed' | 'copied' | 'typechange';
+  original: string; modified: string; binary: boolean; omitted?: boolean;
+}
+
+export interface CommitDetail {
+  sha: string; parent: string | null; author: string; email: string; date: string; subject: string; body: string;
+  files: FileVersions[]; truncated: boolean;
+}
+
+export interface Comparison {
+  base: string; head: string; mergeBase: string | null; commits: CommitSummary[]; files: FileVersions[]; truncated: boolean;
+}
+
+export interface SearchHit { path: string; line: number; text: string }
+export interface SearchResult { hits: SearchHit[]; truncated: boolean }
+
+export interface PullRequestSummary {
+  number: number; title: string; state: 'open' | 'closed' | 'merged'; draft: boolean; author: string;
+  head: string; base: string; url: string; createdAt: string; updatedAt: string;
+}
+
+export interface PullRequestDetail extends PullRequestSummary {
+  body: string; headSha: string; mergeable: boolean | null; mergeableState: string;
+  checks: { state: 'success' | 'pending' | 'failure' | 'none'; total: number; failed: number; pending: number } | null;
+  files: { path: string; status: string; additions: number; deletions: number; patch?: string }[];
+  filesTruncated: boolean; canMerge: boolean;
+}
+
+export interface BranchList { current: string; local: string[]; remote: string[] }

@@ -7,6 +7,8 @@ import { Members } from '../components/Members';
 import { RepositoryCard, WorkspacesCard } from '../components/RepoAndWorkspaces';
 import { NetworkCard, VariablesCard } from '../components/VariablesAndNetwork';
 import { AwsCard } from '../components/AwsCard';
+import { AgentInstructionsCard } from '../components/AgentInstructionsCard';
+import { TeamActivityCard } from '../components/TeamActivityCard';
 import type { Repository } from '../api';
 
 export function ApplicationPage() {
@@ -71,6 +73,8 @@ export function ApplicationPage() {
       <VariablesCard environments={a.environments} isOrgAdmin={!!me?.user.isOrgAdmin} />
       <NetworkCard appId={a.id} canEdit={perms.includes('application.update')} />
       <AwsCard environments={a.environments} isOrgAdmin={!!me?.user.isOrgAdmin} onChanged={app.reload} />
+      <AgentInstructionsCard appId={a.id} canEdit={perms.includes('application.update')} />
+      {perms.includes('application.update') && <TeamActivityCard appId={a.id} />}
 
       {perms.includes('application.view') && (
         <Members

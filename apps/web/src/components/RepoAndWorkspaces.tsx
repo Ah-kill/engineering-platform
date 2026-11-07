@@ -1,11 +1,14 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { api, type EnvironmentRow, type Repository, type Workspace } from '../api';
+import { api, type ApplicationDetail, type EnvironmentRow, type GithubRepoSummary, type Repository, type SettingsWithGithub, type SharedWorkspace } from '../api';
 import { useAction, useResource } from '../hooks';
 
 export function RepositoryCard({ appId, canEdit, onChange }: { appId: string; canEdit: boolean; onChange(r: Repository | null): void }) {
   const repo = useResource<Repository | null>(`/applications/${appId}/repository`);
+  const app = useResource<ApplicationDetail>(`/applications/${appId}`);
+  const settings = useResource<SettingsWithGithub>(canEdit ? '/me/settings' : null);
   const [editing, setEditing] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [url, setUrl] = useState('');
   const [branch, setBranch] = useState('');
 
@@ -23,14 +26,22 @@ export function RepositoryCard({ appId, canEdit, onChange }: { appId: string; ca
     void save.run();
   };
 
+  const tokens = settings.data?.githubTokens ?? [];
+  const isNewApp = app.data?.origin === 'new';
+
   return (
     <div className="card stack">
-      <div className="page-head" style={{ marginBottom: 0 }}>
+      <div className="page-head" style={{ marginBottom: 0, flexWrap: 'wrap' }}>
         <h2 style={{ margin: 0 }}>Repository</h2>
-        {canEdit && !editing && (
-          <button className="small" onClick={() => { setUrl(repo.data?.url ?? ''); setBranch(repo.data?.defaultBranch ?? ''); setEditing(true); }}>
-            {repo.data ? 'Change' : 'Connect GitHub repository'}
-          </button>
+        {canEdit && !editing && !creating && (
+          <div className="form-row" style={{ gap: 6 }}>
+            {repo.data === null && (
+              <button className={`small${isNewApp ? ' primary' : ''}`} onClick={() => setCreating(true)}>Create a new GitHub repository</button>
+            )}
+            <button className="small" onClick={() => { setUrl(repo.data?.url ?? ''); setBranch(repo.data?.defaultBranch ?? ''); setEditing(true); }}>
+              {repo.data ? 'Change' : 'Connect GitHub repository'}
+            </button>
+          </div>
         )}
       </div>
       {repo.data && !editing && (
@@ -39,14 +50,35 @@ export function RepositoryCard({ appId, canEdit, onChange }: { appId: string; ca
           <span className="muted"> · default branch </span><code>{repo.data.defaultBranch}</code>
         </div>
       )}
-      {repo.data === null && !editing && <p className="muted" style={{ margin: 0 }}>No repository connected yet.{!canEdit && ' Ask an app admin to connect one.'}</p>}
+      {repo.data === null && !editing && !creating && (
+        <p className="muted" style={{ margin: 0 }}>
+          No repository connected yet.
+          {canEdit && isNewApp && ' This app is built from scratch: create a new repository for it, or connect an existing one.'}
+          {!canEdit && ' Ask an app admin to connect one.'}
+        </p>
+      )}
+      {creating && (
+        <CreateRepository
+          appId={appId}
+          defaultName={app.data?.slug ?? ''}
+          defaultDescription={app.data?.description ?? ''}
+          owners={tokens.map((t) => t.owner).filter((o): o is string => !!o)}
+          hasToken={tokens.length > 0}
+          onDone={async () => { setCreating(false); await repo.reload(); }}
+          onCancel={() => setCreating(false)}
+        />
+      )}
       {editing && (
         <form className="form" onSubmit={submit}>
           <div className="form-row">
             <label style={{ flex: '3 1 260px' }}>GitHub URL<input required value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://github.com/client/payment-service" /></label>
             <label>Default branch<input value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="auto-detect" /></label>
           </div>
-          <p className="muted" style={{ margin: 0, fontSize: 13 }}>With your GitHub token saved in Settings, access and the default branch are checked automatically.</p>
+          {settings.data && <RepoPicker
+            tokens={tokens.map((t) => t.owner)}
+            onPick={(r) => { setUrl(`https://github.com/${r.fullName}`); setBranch(r.defaultBranch); }}
+          />}
+          <p className="muted" style={{ margin: 0, fontSize: 13 }}>With a GitHub token for the repository's owner saved in Settings, access and the default branch are checked automatically.</p>
           {save.error && <div className="error">{save.error}</div>}
           <div className="form-row">
             <button className="primary" disabled={save.pending}>Save</button>
@@ -58,9 +90,115 @@ export function RepositoryCard({ appId, canEdit, onChange }: { appId: string; ca
   );
 }
 
+/** Searchable list of the repositories the caller's GitHub tokens can reach. Typing a URL above still works. */
+function RepoPicker({ tokens, onPick }: { tokens: (string | null)[]; onPick(r: GithubRepoSummary): void }) {
+  const owners = tokens.filter((o): o is string => !!o);
+  const hasDefault = tokens.includes(null);
+  // With only owner tokens, start on the first owner; the default token can list everything.
+  const [owner, setOwner] = useState<string>(hasDefault || !owners[0] ? '' : owners[0]);
+  const [filter, setFilter] = useState('');
+  const path = tokens.length ? `/me/github/repos${owner ? `?owner=${encodeURIComponent(owner)}` : ''}` : null;
+  const repos = useResource<{ repos: GithubRepoSummary[]; truncated: boolean }>(path);
+  const shown = useMemo(() => {
+    const f = filter.trim().toLowerCase();
+    const list = repos.data?.repos ?? [];
+    return (f ? list.filter((r) => r.fullName.toLowerCase().includes(f) || r.description.toLowerCase().includes(f)) : list).slice(0, 100);
+  }, [repos.data, filter]);
+
+  if (!tokens.length) {
+    return <p className="muted" style={{ margin: 0, fontSize: 13 }}>Save a GitHub token in Settings to pick from your repositories.</p>;
+  }
+  return (
+    <div className="repo-picker">
+      <div className="form-row">
+        {(owners.length > 0) && (
+          <label style={{ flex: '1 1 140px' }}>
+            Owner
+            <select value={owner} onChange={(e) => setOwner(e.target.value)}>
+              {hasDefault && <option value="">All my repositories</option>}
+              {owners.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </label>
+        )}
+        <label style={{ flex: '2 1 200px' }}>
+          Find a repository
+          <input type="search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Type to filter" autoComplete="off" />
+        </label>
+      </div>
+      {repos.loading && !repos.data && <p className="muted" style={{ margin: 0 }}>Loading repositories from GitHub…</p>}
+      {repos.error && <div className="error">{repos.error.message}</div>}
+      {repos.data && (
+        <ul className="repo-list" aria-label="Your GitHub repositories">
+          {shown.map((r) => (
+            <li key={r.fullName}>
+              <button type="button" className="repo-row" onClick={() => onPick(r)}>
+                <span className="mono repo-name">{r.fullName}</span>
+                {r.private && <span className="badge">private</span>}
+                {r.description && <span className="muted repo-desc">{r.description}</span>}
+              </button>
+            </li>
+          ))}
+          {!shown.length && <li className="muted" style={{ padding: 8 }}>No matching repositories.</li>}
+        </ul>
+      )}
+      {repos.data?.truncated && <p className="muted" style={{ margin: 0, fontSize: 12.5 }}>Showing the 300 most recently updated repositories. Type the URL above if yours is missing.</p>}
+    </div>
+  );
+}
+
+function CreateRepository(props: {
+  appId: string;
+  defaultName: string;
+  defaultDescription: string;
+  owners: string[];
+  hasToken: boolean;
+  onDone(): Promise<void>;
+  onCancel(): void;
+}) {
+  const [owner, setOwner] = useState(props.owners[0] ?? '');
+  const [name, setName] = useState(props.defaultName);
+  const [description, setDescription] = useState(props.defaultDescription);
+  const [isPrivate, setPrivate] = useState(true);
+  const create = useAction(async () => {
+    await api('POST', `/applications/${props.appId}/repository/create`, { owner: owner.trim(), name: name.trim(), description, private: isPrivate });
+    await props.onDone();
+  });
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    void create.run();
+  };
+  return (
+    <form className="form" onSubmit={submit}>
+      <div className="form-row">
+        <label>
+          Organization or user
+          <input required list="repo-owners" value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="client-org" autoComplete="off" spellCheck={false} />
+          <datalist id="repo-owners">{props.owners.map((o) => <option key={o} value={o} />)}</datalist>
+        </label>
+        <label>
+          Repository name
+          <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="payment-service" autoComplete="off" spellCheck={false} />
+        </label>
+      </div>
+      <label>Description<input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Optional" /></label>
+      <label className="checkbox"><input type="checkbox" checked={isPrivate} onChange={(e) => setPrivate(e.target.checked)} /> Private repository</label>
+      <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+        Created on GitHub with a README so the default branch exists, using your token for that owner
+        (it needs <b>Administration: read and write</b>), then connected to this application.
+        {!props.hasToken && <> You have no GitHub token yet: add one in <Link to="/settings">Settings</Link>.</>}
+      </p>
+      {create.error && <div className="error">{create.error}</div>}
+      <div className="form-row">
+        <button className="primary" disabled={create.pending}>{create.pending ? 'Creating…' : 'Create repository'}</button>
+        <button type="button" onClick={props.onCancel}>Cancel</button>
+      </div>
+    </form>
+  );
+}
+
 export function WorkspacesCard({ appId, repo, environments }: { appId: string; repo: Repository | null; environments: EnvironmentRow[] }) {
   const navigate = useNavigate();
-  const workspaces = useResource<Workspace[]>(`/applications/${appId}/workspaces`);
+  const workspaces = useResource<SharedWorkspace[]>(`/applications/${appId}/workspaces`);
   const usable = environments.filter((e) => e.permissions.includes('environment.use'));
   const [creating, setCreating] = useState(false);
   const [envId, setEnvId] = useState('');
@@ -72,7 +210,7 @@ export function WorkspacesCard({ appId, repo, environments }: { appId: string; r
     if (!envId && usable[0]) setEnvId(usable[0].id);
   }, [usable, envId]);
 
-  const remove = useAction(async (w: Workspace) => {
+  const remove = useAction(async (w: SharedWorkspace) => {
     await api('DELETE', `/workspaces/${w.id}`);
     await workspaces.reload();
   });
@@ -138,15 +276,22 @@ export function WorkspacesCard({ appId, repo, environments }: { appId: string; r
             <tbody>
               {workspaces.data.map((w) => (
                 <tr key={w.id}>
-                  <td><Link to={`/workspaces/${w.id}`} className="mono">{w.branch}</Link></td>
+                  <td>
+                    <Link to={`/workspaces/${w.id}`} className="mono">{w.branch}</Link>
+                    {w.access && w.access !== 'owner' && (
+                      <div className="muted" style={{ fontSize: 12 }}>Shared by {w.ownerName} · {w.access === 'viewer' ? 'can view' : 'can edit'}</div>
+                    )}
+                  </td>
                   <td>{w.environmentName}</td>
                   <td>{w.state === 'ready' ? <span className="badge ok">ready</span> : <span className={`badge${w.state === 'failed' ? ' warn' : ''}`}>{w.state}</span>}</td>
                   <td className="muted">{new Date(w.lastActiveAt).toLocaleString()}</td>
                   <td style={{ textAlign: 'right' }}>
-                    <button className="small danger" aria-label={`Delete workspace ${w.branch}`} disabled={remove.pending}
-                      onClick={() => { if (confirm(`Delete workspace ${w.branch}? Unpushed work is lost.`)) void remove.run(w); }}>
-                      Delete
-                    </button>
+                    {(!w.access || w.access === 'owner') && (
+                      <button className="small danger" aria-label={`Delete workspace ${w.branch}`} disabled={remove.pending}
+                        onClick={() => { if (confirm(`Delete workspace ${w.branch}? Unpushed work is lost.`)) void remove.run(w); }}>
+                        Delete
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}

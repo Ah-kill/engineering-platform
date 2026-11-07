@@ -308,3 +308,61 @@ ahead of git, or the next `git pull` will conflict.
 - [ ] Daily `pg_dump` copied off the machine, and a restore drill done.
 - [ ] Each developer uses their own Claude credential and a fine-grained GitHub token limited to client repositories.
 - [ ] Org admin accounts are few; the Audit log is reviewed now and then.
+
+## Running on EC2: protect the instance metadata service
+
+When the platform runs on an EC2 instance, its own AWS identity (the one that calls
+`sts:AssumeRole` into client roles) is usually the **instance role**. The instance metadata
+service at `169.254.169.254` gives that role's credentials to anything on the machine that
+can reach it, including, in principle, code running in a workspace container.
+
+- Workspaces in the default **Only allowed sites** network mode cannot reach it: their
+  Docker network has no route out except the filtering proxy, which only allows listed host names.
+- Workspaces in **Unrestricted** network mode are *not* blocked by the platform. Without
+  protection, a malicious build script or a prompt-injected command could read the platform's
+  base AWS credentials. On their own they cannot assume a client role (that also needs the
+  client's ExternalId, which stays encrypted in the database), but they are the platform's
+  identity towards every client and must never leave the server.
+
+Require **IMDSv2 with a hop limit of 1** on the instance. IMDSv2 needs a session token from
+a `PUT` request first, and a hop limit of 1 means the token reply cannot cross the extra
+network hop into a container, so containers get no token and no credentials, while the
+platform process on the host keeps working. Some newer AMIs (for example Amazon Linux 2023)
+default to a hop limit of 2 precisely so that containers *can* reach the service; change it.
+
+```bash
+# Existing instance (from a machine with EC2 admin rights)
+aws ec2 modify-instance-metadata-options --instance-id i-0123456789abcdef0 \
+  --http-tokens required --http-put-response-hop-limit 1 --http-endpoint enabled
+
+# Launch templates / CloudFormation: MetadataOptions:
+#   HttpTokens: required
+#   HttpPutResponseHopLimit: 1
+```
+
+Defense in depth, optional: drop container traffic to the metadata address on the host. The
+`DOCKER-USER` chain only sees forwarded (container) traffic, so the host itself is unaffected.
+
+```bash
+sudo iptables -I DOCKER-USER -d 169.254.169.254/32 -j DROP
+# Persist it with your firewall tooling (for example iptables-persistent).
+```
+
+Check from inside a workspace in Unrestricted mode (browser terminal). Both commands should
+fail or time out:
+
+```bash
+curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'
+curl -s -m 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+Related notes for the AWS integration:
+- The workspace image ships **AWS CLI v2** (`aws --version` in a terminal). It uses the
+  short-lived `AWS_*` variables the platform injects at run start and terminal open.
+- An environment can narrow those credentials with a **session policy** (*AWS access* →
+  *Enforced permissions*): read-only investigation, deploy (Lambda + CloudFormation), or a
+  custom list. It can only remove permissions from the client's role, never add any.
+- In "Only allowed sites" mode the platform opens STS, IAM and the regional endpoints of common
+  services for the environment's region. S3 is deliberately not among them (bucket hosts in
+  any account would become reachable). For deployments that upload artifacts, add the specific
+  bucket host, e.g. `my-artifacts.s3.eu-west-1.amazonaws.com`, to the application's allowed sites.

@@ -10,6 +10,13 @@ import { migrate } from '../src/db/migrate.js';
 import { buildApp } from '../src/http/app.js';
 import { Vault } from '../src/vault/vault.js';
 import { awsSecretValues, issueAwsEnv, issueAwsEnvForRun, sessionNameFor } from '../src/aws/aws.js';
+import {
+  MAX_SESSION_POLICY_CHARS,
+  presetFor,
+  SESSION_POLICY_PRESETS,
+  sessionPolicyDocument,
+  validateAllowedActions,
+} from '../src/aws/session-policy.js';
 import { setStsClient, stsError, type AssumeRoleParams, type AwsTemporaryCredentials, type StsClient } from '../src/aws/sts.js';
 import { Client, PASSWORD, seedOrg, WEB_ORIGIN } from './helpers.js';
 
@@ -214,7 +221,7 @@ describe('external id', () => {
     expect(saved.body).not.toContain(EXTERNAL_ID);
     const got = await dev.get(`/api/environments/${devEnvId}/aws`);
     expect(got.statusCode).toBe(200);
-    expect(got.json()).toEqual({ roleArn: ROLE, region: 'eu-west-1', sessionSeconds: 3600, access: 'read', externalIdSet: true, hint: '…CRET' });
+    expect(got.json()).toEqual({ roleArn: ROLE, region: 'eu-west-1', sessionSeconds: 3600, access: 'read', externalIdSet: true, hint: '…CRET', allowedActions: null, policyPreset: null });
     expect(got.body).not.toContain(EXTERNAL_ID);
 
     const [row] = await db.system((q) => q.query<{ aws_external_id: string }>('SELECT aws_external_id FROM environments WHERE id = $1', [devEnvId]));
@@ -231,7 +238,7 @@ describe('external id', () => {
 
     const cleared = await lead.delete(`/api/environments/${devEnvId}/aws`);
     expect(cleared.statusCode).toBe(200);
-    expect(cleared.json()).toEqual({ roleArn: null, region: 'us-east-1', sessionSeconds: 3600, access: 'read', externalIdSet: false, hint: '' });
+    expect(cleared.json()).toEqual({ roleArn: null, region: 'us-east-1', sessionSeconds: 3600, access: 'read', externalIdSet: false, hint: '', allowedActions: null, policyPreset: null });
     const [row] = await db.system((q) => q.query<{ aws_external_id: string | null }>('SELECT aws_external_id FROM environments WHERE id = $1', [devEnvId]));
     expect(row!.aws_external_id).toBeNull();
   });
@@ -358,5 +365,150 @@ describe('issueAwsEnv', () => {
   it('builds valid session names', () => {
     expect(sessionNameFor('0a1b2c3d-0000-0000-0000-000000000000', 'ffeeddcc-1111-1111-1111-111111111111')).toBe('ep-0a1b2c3d-ffeeddcc');
     expect(sessionNameFor('0a1b2c3d-0000-0000-0000-000000000000')).toBe('ep-0a1b2c3d-test');
+  });
+});
+
+describe('session policy (enforced permissions)', () => {
+  const READ_ONLY = SESSION_POLICY_PRESETS.find((p) => p.id === 'read-only')!.actions;
+  const DEPLOY = SESSION_POLICY_PRESETS.find((p) => p.id === 'deploy')!.actions;
+  const latestIssued = async () => {
+    const [event] = await db.system((q) => q.query<{ outcome: string; details: Record<string, unknown> }>(
+      `SELECT outcome, details FROM audit_events WHERE action = 'aws.credentials.issued' ORDER BY occurred_at DESC LIMIT 1`));
+    return event!;
+  };
+
+  it('serves the presets, which are valid and fit the STS size limit', async () => {
+    const r = await viewer.get('/api/aws/session-policy-presets');
+    expect(r.statusCode).toBe(200);
+    const body = r.json() as { presets: { id: string; name: string; actions: string[] }[]; maxActions: number; maxPolicyChars: number };
+    expect(body.presets.map((p) => [p.id, p.name])).toEqual([
+      ['read-only', 'Read-only investigation'],
+      ['deploy', 'Deploy (Lambda + CloudFormation)'],
+    ]);
+    expect(body).toMatchObject({ maxActions: 100, maxPolicyChars: 2048 });
+    for (const p of SESSION_POLICY_PRESETS) {
+      expect(validateAllowedActions(p.actions)).toEqual(p.actions);
+      expect(sessionPolicyDocument(p.actions).length).toBeLessThanOrEqual(MAX_SESSION_POLICY_CHARS);
+    }
+    // read-only covers the investigation basics; deploy is a superset with the write actions
+    for (const a of ['logs:FilterLogEvents', 'logs:StartQuery', 'logs:GetQueryResults', 'cloudwatch:Get*', 'lambda:List*', 'apigateway:GET',
+      'dynamodb:Describe*', 'ecs:List*', 'eks:Describe*', 'cloudformation:Get*', 'ec2:Describe*', 's3:GetBucket*', 'sts:GetCallerIdentity']) {
+      expect(READ_ONLY).toContain(a);
+    }
+    expect(READ_ONLY.some((a) => /:(Put|Update|Create|Delete|Execute|Publish|Pass)/.test(a))).toBe(false);
+    expect(DEPLOY).toEqual(expect.arrayContaining([...READ_ONLY, 'lambda:Update*', 'lambda:Publish*', 'cloudformation:ExecuteChangeSet', 's3:PutObject', 'iam:PassRole']));
+    expect((await app.inject({ method: 'GET', url: '/api/aws/session-policy-presets' })).statusCode).toBe(401);
+  });
+
+  it('stores a preset, a custom list, keeps it when omitted and clears it with null', async () => {
+    let r = await put(lead, devEnvId, good({ allowedActions: READ_ONLY }));
+    expect(r.statusCode).toBe(200);
+    expect(r.json()).toMatchObject({ allowedActions: READ_ONLY, policyPreset: 'read-only' });
+
+    // order does not matter for recognising a preset
+    r = await put(lead, devEnvId, good({ allowedActions: [...DEPLOY].reverse() }));
+    expect(r.json().policyPreset).toBe('deploy');
+
+    // custom: trimmed and de-duplicated
+    r = await put(lead, devEnvId, good({ allowedActions: [' logs:FilterLogEvents ', 'logs:FilterLogEvents', 'lambda:GetFunction'] }));
+    expect(r.statusCode).toBe(200);
+    expect(r.json()).toMatchObject({ allowedActions: ['logs:FilterLogEvents', 'lambda:GetFunction'], policyPreset: 'custom' });
+
+    // omitted keeps the stored list (like the ExternalId)
+    r = await put(lead, devEnvId, good());
+    expect(r.json()).toMatchObject({ allowedActions: ['logs:FilterLogEvents', 'lambda:GetFunction'], policyPreset: 'custom' });
+    expect((await dev.get(`/api/environments/${devEnvId}/aws`)).json().allowedActions).toEqual(['logs:FilterLogEvents', 'lambda:GetFunction']);
+
+    r = await put(lead, devEnvId, good({ allowedActions: null }));
+    expect(r.json()).toMatchObject({ allowedActions: null, policyPreset: null });
+
+    // DELETE removes it too
+    await put(lead, devEnvId, good({ allowedActions: READ_ONLY }));
+    expect((await lead.delete(`/api/environments/${devEnvId}/aws`)).json()).toMatchObject({ allowedActions: null, policyPreset: null });
+  });
+
+  it('rejects malformed actions, too many entries, an empty list and a policy over the size limit', async () => {
+    for (const action of ['logs', 'Logs:GetLogEvents', 'logs:Get Log', 'logs:Get:X', 's3:Get/Object', ':Get', 'logs:', '*', 'logs:Get?']) {
+      const r = await put(lead, devEnvId, good({ allowedActions: ['ec2:Describe*', action] }));
+      expect(r.statusCode, action).toBe(400);
+      expect(r.json().error.message, action).toMatch(/Not an AWS action/);
+    }
+    let r = await put(lead, devEnvId, good({ allowedActions: Array.from({ length: 101 }, (_, i) => `ec2:DescribeThing${i}`) }));
+    expect(r.statusCode).toBe(400);
+    expect(r.json().error.message).toMatch(/At most 100 AWS actions/);
+
+    r = await put(lead, devEnvId, good({ allowedActions: [] }));
+    expect(r.statusCode).toBe(400);
+    expect(r.json().error.message).toMatch(/at least one AWS action/);
+
+    // 60 valid but long actions: under the entry limit, over 2048 characters as policy JSON
+    const long = Array.from({ length: 60 }, (_, i) => `cloudformation:DescribeStackResourceDrifts${i}`);
+    expect(sessionPolicyDocument(long).length).toBeGreaterThan(MAX_SESSION_POLICY_CHARS);
+    r = await put(lead, devEnvId, good({ allowedActions: long }));
+    expect(r.statusCode).toBe(400);
+    expect(r.json().error.message).toMatch(/at most 2048/);
+
+    expect((await put(lead, devEnvId, good({ allowedActions: 'logs:*' }))).statusCode).toBe(400);
+    // nothing invalid was stored
+    expect((await lead.get(`/api/environments/${devEnvId}/aws`)).json().allowedActions).toBeNull();
+  });
+
+  it('passes the policy to STS and audits the preset name and count, never keys', async () => {
+    await put(lead, devEnvId, good({ allowedActions: READ_ONLY }));
+    const env = await db.tenant(orgId, (q) => issueAwsEnv(q, vault, sts, { environmentId: devEnvId, userId: devUserId, workspaceId }));
+    expect(env).not.toBeNull();
+    const call = sts.assumed[0]!;
+    expect(JSON.parse(call.policy!)).toEqual({ Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: READ_ONLY, Resource: '*' }] });
+    expect(call).toMatchObject({ roleArn: ROLE, externalId: EXTERNAL_ID });
+
+    const event = await latestIssued();
+    expect(event.outcome).toBe('success');
+    expect(event.details).toMatchObject({ policyPreset: 'read-only', policyActionCount: READ_ONLY.length });
+    const text = JSON.stringify(event);
+    for (const secret of [env!.AWS_ACCESS_KEY_ID, env!.AWS_SECRET_ACCESS_KEY, env!.AWS_SESSION_TOKEN, EXTERNAL_ID]) {
+      expect(text).not.toContain(secret);
+    }
+
+    // issueAwsEnvForRun and the connection test use the same policy
+    await put(lead, devEnvId, good({ allowedActions: ['logs:FilterLogEvents'] }));
+    await issueAwsEnvForRun(db, orgId, vault, sts, { environmentId: devEnvId, userId: devUserId, workspaceId });
+    expect(JSON.parse(sts.assumed[1]!.policy!).Statement[0].Action).toEqual(['logs:FilterLogEvents']);
+    expect((await latestIssued()).details).toMatchObject({ policyPreset: 'custom', policyActionCount: 1 });
+    expect((await dev.post(`/api/environments/${devEnvId}/aws/test`)).statusCode).toBe(200);
+    expect(JSON.parse(sts.assumed[2]!.policy!).Statement[0].Action).toEqual(['logs:FilterLogEvents']);
+  });
+
+  it('passes no policy when none is set (the role applies as-is)', async () => {
+    await put(lead, devEnvId, good({ allowedActions: null }));
+    await db.tenant(orgId, (q) => issueAwsEnv(q, vault, sts, { environmentId: devEnvId, userId: devUserId, workspaceId }));
+    expect(sts.assumed[0]!.policy).toBeUndefined();
+    expect((await latestIssued()).details).toMatchObject({ policyPreset: 'none', policyActionCount: 0 });
+  });
+
+  it('only an org admin can change the session policy of production', async () => {
+    const byLead = await put(lead, prodEnvId, good({ allowedActions: DEPLOY, access: 'write' }));
+    expect(byLead.statusCode).toBe(403);
+    expect(byLead.json().error.message).toMatch(/org admin/);
+    const byAdmin = await put(admin, prodEnvId, good({ allowedActions: DEPLOY, access: 'write' }));
+    expect(byAdmin.statusCode).toBe(200);
+    expect(byAdmin.json()).toMatchObject({ policyPreset: 'deploy', access: 'write' });
+    expect((await lead.get(`/api/environments/${prodEnvId}/aws`)).json().policyPreset).toBe('deploy');
+    // a lead cannot loosen it either
+    expect((await put(lead, prodEnvId, good({ allowedActions: null }))).statusCode).toBe(403);
+    const [event] = await db.system((q) => q.query<{ details: Record<string, unknown> }>(
+      `SELECT details FROM audit_events WHERE environment_id = $1 AND action = 'aws.config.updated' ORDER BY occurred_at DESC LIMIT 1`, [prodEnvId]));
+    expect(event!.details).toMatchObject({ policyPreset: 'deploy' });
+    expect(JSON.stringify(event)).not.toContain(EXTERNAL_ID);
+  });
+
+  it('recognises presets regardless of order and maps a packed-size rejection clearly', () => {
+    expect(presetFor(null)).toBeNull();
+    expect(presetFor([...READ_ONLY].reverse())).toBe('read-only');
+    expect(presetFor(READ_ONLY.slice(1))).toBe('custom');
+    expect(presetFor([...READ_ONLY, 's3:PutObject'])).toBe('custom');
+    const e = stsError(awsError('PackedPolicyTooLarge', 'Packed policy consumes 112% of allotted space'), 'eu-west-1');
+    expect(e.statusCode).toBe(400);
+    expect(e.message).toMatch(/too large .*wildcards/);
+    expect(() => validateAllowedActions(Array.from({ length: 100 }, (_, i) => `ec2:Describe${i}`))).not.toThrow();
   });
 });

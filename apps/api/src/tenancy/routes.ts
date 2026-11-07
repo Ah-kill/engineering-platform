@@ -38,7 +38,10 @@ const createAppBody = z.object({
   /** Creates development, staging and production (protected) environments. */
   createDefaultEnvironments: z.boolean().default(true),
 });
-const updateAppBody = z.object({ name, description }).partial();
+/** Project instructions for Claude, appended to its system prompt below the platform's rules. */
+export const MAX_AGENT_INSTRUCTIONS = 20_000;
+const agentInstructions = z.string().max(MAX_AGENT_INSTRUCTIONS, `At most ${MAX_AGENT_INSTRUCTIONS} characters`).transform((s) => s.trim());
+const updateAppBody = z.object({ name, description, agentInstructions }).partial();
 
 const createEnvBody = z.object({
   name: slug,
@@ -244,7 +247,8 @@ export async function tenancyRoutes(app: FastifyInstance, { db }: RouteDeps) {
       const principal = principalOf(user);
       await requireVisible(q, principal, { type: 'application', id });
       const [application] = await q.query(
-        `SELECT ${APP_COLS}, c.name AS "clientName" FROM applications a JOIN clients c ON c.id = a.client_id WHERE a.id = $1`,
+        `SELECT ${APP_COLS}, a.agent_instructions AS "agentInstructions", c.name AS "clientName"
+           FROM applications a JOIN clients c ON c.id = a.client_id WHERE a.id = $1`,
         [id],
       );
       const seesAll = (await authorize(q, principal, 'environment.view', { type: 'application', id })).allowed;
@@ -271,13 +275,17 @@ export async function tenancyRoutes(app: FastifyInstance, { db }: RouteDeps) {
     return db.tenant(user.orgId, async (q) => {
       const chain = await requirePermission(q, principalOf(user), 'application.update', { type: 'application', id });
       const [row] = await q.query(
-        `UPDATE applications a SET name = coalesce($2, name), description = coalesce($3, description), updated_at = now()
-          WHERE a.id = $1 RETURNING ${APP_COLS}`,
-        [id, body.name ?? null, body.description ?? null],
+        `UPDATE applications a SET name = coalesce($2, name), description = coalesce($3, description),
+                agent_instructions = coalesce($4, agent_instructions), updated_at = now()
+          WHERE a.id = $1 RETURNING ${APP_COLS}, a.agent_instructions AS "agentInstructions"`,
+        [id, body.name ?? null, body.description ?? null, body.agentInstructions ?? null],
       );
+      // The instructions themselves can be long; the audit log records that they changed and their size.
+      const { agentInstructions: instructions, ...rest } = body;
       await audit(q, {
         orgId: user.orgId, actorId: user.id, action: 'application.updated', resourceType: 'application',
-        resourceId: id, clientId: chain?.clientId, applicationId: id, details: body,
+        resourceId: id, clientId: chain?.clientId, applicationId: id,
+        details: { ...rest, ...(instructions !== undefined ? { agentInstructionsChars: instructions.length } : {}) },
       });
       return row;
     });

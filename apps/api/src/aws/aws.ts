@@ -3,6 +3,7 @@ import { audit } from '../audit/audit.js';
 import type { Database, Queryable } from '../db/db.js';
 import { HttpError } from '../http/errors.js';
 import { hintFor, type Vault } from '../vault/vault.js';
+import { presetFor, sessionPolicyDocument, validateAllowedActions, type PresetId } from './session-policy.js';
 import { stsError, type AssumeRoleParams, type AwsTemporaryCredentials, type StsClient } from './sts.js';
 
 /**
@@ -35,6 +36,13 @@ export interface AwsConfigView {
   externalIdSet: boolean;
   /** Short hint of the stored ExternalId (like other secrets), '' when none. */
   hint: string;
+  /**
+   * IAM actions the STS session may use (enforced with an inline session policy), or null to
+   * use the role's own permissions unchanged. `access` above is informational only.
+   */
+  allowedActions: string[] | null;
+  /** Which preset `allowedActions` matches: 'read-only', 'deploy', 'custom', or null when unset. */
+  policyPreset: PresetId | 'custom' | null;
 }
 
 export interface AwsConfigInput {
@@ -44,6 +52,8 @@ export interface AwsConfigInput {
   region: string;
   sessionSeconds: number;
   access: AwsAccess;
+  /** undefined keeps the stored list; null removes the session policy; a list replaces it. */
+  allowedActions?: string[] | null;
 }
 
 /** The ARN partition must match the region's partition (aws-cn ↔ cn-*, aws-us-gov ↔ us-gov-*). */
@@ -69,11 +79,12 @@ interface ConfigRow {
   aws_region: string | null;
   aws_session_seconds: number;
   aws_access: AwsAccess;
+  aws_allowed_actions: string[] | null;
 }
 
 async function loadRow(q: Queryable, environmentId: string): Promise<ConfigRow> {
   const [row] = await q.query<ConfigRow>(
-    `SELECT org_id, aws_role_arn, aws_external_id, aws_external_id_hint, aws_region, aws_session_seconds, aws_access
+    `SELECT org_id, aws_role_arn, aws_external_id, aws_external_id_hint, aws_region, aws_session_seconds, aws_access, aws_allowed_actions
        FROM environments WHERE id = $1`,
     [environmentId],
   );
@@ -89,6 +100,8 @@ function toView(r: ConfigRow): AwsConfigView {
     access: r.aws_access,
     externalIdSet: r.aws_external_id !== null,
     hint: r.aws_external_id !== null ? r.aws_external_id_hint : '',
+    allowedActions: r.aws_allowed_actions,
+    policyPreset: presetFor(r.aws_allowed_actions),
   };
 }
 
@@ -104,6 +117,7 @@ export async function saveAwsConfig(q: Queryable, vault: Vault, environmentId: s
     throw HttpError.badRequest('Session length must be between 900 and 43200 seconds');
   }
   checkPartition(input.roleArn, input.region);
+  const allowedActions = input.allowedActions ? validateAllowedActions(input.allowedActions) : input.allowedActions;
   const current = await loadRow(q, environmentId);
   if (input.externalId !== undefined && !EXTERNAL_ID_RE.test(input.externalId)) {
     throw HttpError.badRequest('ExternalId must be 2-1224 characters: letters, digits and +=,.@:/-_');
@@ -121,6 +135,7 @@ export async function saveAwsConfig(q: Queryable, vault: Vault, environmentId: s
         aws_access = $5,
         aws_external_id = CASE WHEN $6 THEN $7 ELSE aws_external_id END,
         aws_external_id_hint = CASE WHEN $6 THEN $8 ELSE aws_external_id_hint END,
+        aws_allowed_actions = CASE WHEN $9 THEN $10::text[] ELSE aws_allowed_actions END,
         updated_at = now()
       WHERE id = $1`,
     [
@@ -132,6 +147,8 @@ export async function saveAwsConfig(q: Queryable, vault: Vault, environmentId: s
       replace,
       replace ? vault.encrypt(input.externalId!) : null,
       replace ? hintFor(input.externalId!) : '',
+      allowedActions !== undefined,
+      allowedActions ?? null,
     ],
   );
   return readAwsConfig(q, environmentId);
@@ -141,7 +158,7 @@ export async function saveAwsConfig(q: Queryable, vault: Vault, environmentId: s
 export async function clearAwsConfig(q: Queryable, environmentId: string): Promise<AwsConfigView> {
   await q.query(
     `UPDATE environments SET aws_role_arn = NULL, aws_external_id = NULL, aws_external_id_hint = '',
-        aws_session_seconds = ${DEFAULT_SESSION_SECONDS}, aws_access = 'read', updated_at = now()
+        aws_session_seconds = ${DEFAULT_SESSION_SECONDS}, aws_access = 'read', aws_allowed_actions = NULL, updated_at = now()
       WHERE id = $1`,
     [environmentId],
   );
@@ -168,6 +185,10 @@ export interface AwsIssuePlan {
   userId: string;
   workspaceId: string | null;
   access: AwsAccess;
+  /** The session policy's preset ('read-only', 'deploy', 'custom') or null when none is passed. For audit. */
+  policyPreset: PresetId | 'custom' | null;
+  /** Number of allowed actions in the session policy, 0 when none is passed. */
+  policyActionCount: number;
   params: AssumeRoleParams;
 }
 
@@ -194,6 +215,7 @@ export async function prepareAwsIssue(
   if (!row.aws_role_arn) return null;
   if (!row.aws_external_id) throw HttpError.badRequest('The AWS role of this environment has no ExternalId. Set one first.');
   if (!row.aws_region) throw HttpError.badRequest('The environment has no AWS region. Set one first.');
+  const actions = row.aws_allowed_actions;
   return {
     orgId: row.org_id,
     clientId: chain.clientId,
@@ -202,12 +224,16 @@ export async function prepareAwsIssue(
     userId: input.userId,
     workspaceId: input.workspaceId ?? null,
     access: row.aws_access,
+    policyPreset: presetFor(actions),
+    policyActionCount: actions?.length ?? 0,
     params: {
       roleArn: row.aws_role_arn,
       externalId: vault.decrypt(row.aws_external_id),
       sessionName: sessionNameFor(input.userId, input.workspaceId),
       durationSeconds: opts.durationSeconds ?? row.aws_session_seconds,
       region: row.aws_region,
+      // Narrows the role to exactly these actions; never widens it.
+      ...(actions?.length ? { policy: sessionPolicyDocument(actions) } : {}),
     },
   };
 }
@@ -255,6 +281,8 @@ async function auditIssue(q: Queryable, plan: AwsIssuePlan, outcome: { creds: Aw
       sessionName: plan.params.sessionName,
       durationSeconds: plan.params.durationSeconds,
       access: plan.access,
+      policyPreset: plan.policyPreset ?? 'none',
+      policyActionCount: plan.policyActionCount,
       workspaceId: plan.workspaceId,
       ...('creds' in outcome ? { expiresAt: outcome.creds.expiration.toISOString() } : { error: outcome.error }),
     },
@@ -263,8 +291,10 @@ async function auditIssue(q: Queryable, plan: AwsIssuePlan, outcome: { creds: Aw
 
 /**
  * Assumes the environment's role for one user and workspace and returns AWS_* environment
- * variables, or null when no role is configured. Needs `environment.use`. Audits
- * `aws.credentials.issued` (role, session name, expiry; never the keys).
+ * variables, or null when no role is configured. Needs `environment.use`. When the environment
+ * lists allowed actions, they are passed to STS as an inline session policy, so the credentials
+ * can do no more than that list (and no more than the role). Audits `aws.credentials.issued`
+ * (role, session name, expiry, session policy preset and action count; never the keys).
  *
  * Runs entirely inside the caller's transaction, including the STS network call. With the
  * embedded database a transaction blocks other requests, so prefer `issueAwsEnvForRun`

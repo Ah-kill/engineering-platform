@@ -18,6 +18,7 @@ import { variableRoutes } from '../variables/routes.js';
 import { terminalRoutes } from '../terminal/routes.js';
 import { awsRoutes } from '../aws/routes.js';
 import { usageRoutes } from '../usage/routes.js';
+import { orgRoutes } from '../org/routes.js';
 import { AgentManager } from '../agents/manager.js';
 import { ClaudeSdkDriver, type AgentDriver } from '../agents/driver.js';
 import { githubRemote, type RemoteResolver } from '../workspaces/service.js';
@@ -127,6 +128,7 @@ export async function buildApp(appDeps: AppDeps): Promise<FastifyInstance> {
     await terminalRoutes(api, deps);
     await awsRoutes(api, deps);
     await usageRoutes(api, deps);
+    await orgRoutes(api, deps);
   }, { prefix: '/api' });
 
   // Production (SERVE_WEB=true): serve the built web app from this origin. Hashed assets are

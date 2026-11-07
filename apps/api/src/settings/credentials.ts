@@ -27,18 +27,84 @@ export function validateCredential(kind: CredentialKind, value: string): string 
   return v;
 }
 
-export async function saveCredential(q: Queryable, vault: Vault, orgId: string, userId: string, kind: CredentialKind, value: string) {
+/** GitHub user or organization names. Stored lower case: GitHub treats them case-insensitively. */
+export const GITHUB_OWNER = /^[A-Za-z0-9-]{1,39}$/;
+
+/** Validates an owner name; empty means "no owner" (the default token). */
+export function normaliseGithubOwner(owner: string | null | undefined): string | null {
+  if (owner === undefined || owner === null || owner.trim() === '') return null;
+  const o = owner.trim();
+  if (!GITHUB_OWNER.test(o)) throw HttpError.badRequest('Not a valid GitHub user or organization name');
+  return o.toLowerCase();
+}
+
+/**
+ * Saves (or replaces) a credential. `githubOwner` applies to github_token only: a token for
+ * one GitHub organization or user. null is the default token, used for every other owner.
+ */
+export async function saveCredential(
+  q: Queryable,
+  vault: Vault,
+  orgId: string,
+  userId: string,
+  kind: CredentialKind,
+  value: string,
+  githubOwner: string | null = null,
+) {
+  const owner = normaliseGithubOwner(githubOwner);
+  if (owner !== null && kind !== 'github_token') throw HttpError.badRequest('Only GitHub tokens can be saved per owner');
   await q.query(
-    `INSERT INTO user_credentials (org_id, user_id, kind, ciphertext, hint) VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (user_id, kind) DO UPDATE SET ciphertext = EXCLUDED.ciphertext, hint = EXCLUDED.hint, updated_at = now()`,
-    [orgId, userId, kind, vault.encrypt(value), hintFor(value)],
+    `INSERT INTO user_credentials (org_id, user_id, kind, ciphertext, hint, github_owner) VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (user_id, kind, (coalesce(github_owner, ''))) DO UPDATE
+       SET ciphertext = EXCLUDED.ciphertext, hint = EXCLUDED.hint, updated_at = now()`,
+    [orgId, userId, kind, vault.encrypt(value), hintFor(value), owner],
   );
 }
 
-/** Decrypts a credential for server-side use. Never return the result to a client. */
+export async function deleteCredential(q: Queryable, userId: string, kind: CredentialKind, githubOwner: string | null = null) {
+  await q.query(
+    `DELETE FROM user_credentials WHERE user_id = $1 AND kind = $2 AND coalesce(github_owner, '') = $3`,
+    [userId, kind, normaliseGithubOwner(githubOwner) ?? ''],
+  );
+}
+
+/**
+ * Decrypts a credential for server-side use. Never return the result to a client.
+ * For github_token this is the default token; use readGithubToken() for a repository's owner.
+ */
 export async function readCredential(q: Queryable, vault: Vault, userId: string, kind: CredentialKind): Promise<string | undefined> {
-  const [row] = await q.query<{ ciphertext: string }>('SELECT ciphertext FROM user_credentials WHERE user_id = $1 AND kind = $2', [userId, kind]);
+  const [row] = await q.query<{ ciphertext: string }>(
+    'SELECT ciphertext FROM user_credentials WHERE user_id = $1 AND kind = $2 AND github_owner IS NULL',
+    [userId, kind],
+  );
   return row ? vault.decrypt(row.ciphertext) : undefined;
+}
+
+/** The user's GitHub token for an owner (organization or user), falling back to their default token. */
+export async function readGithubToken(q: Queryable, vault: Vault, userId: string, owner?: string | null): Promise<string | undefined> {
+  const [row] = await q.query<{ ciphertext: string }>(
+    `SELECT ciphertext FROM user_credentials
+      WHERE user_id = $1 AND kind = 'github_token' AND (github_owner IS NULL OR github_owner = $2)
+      ORDER BY github_owner NULLS LAST LIMIT 1`,
+    [userId, owner ? owner.toLowerCase() : null],
+  );
+  return row ? vault.decrypt(row.ciphertext) : undefined;
+}
+
+export interface GithubTokenInfo {
+  /** null = the default token, used for owners without their own. */
+  owner: string | null;
+  hint: string;
+  updatedAt: Date;
+}
+
+/** Saved GitHub tokens, hints only. */
+export async function listGithubTokens(q: Queryable, userId: string): Promise<GithubTokenInfo[]> {
+  return q.query<GithubTokenInfo>(
+    `SELECT github_owner AS owner, hint, updated_at AS "updatedAt" FROM user_credentials
+      WHERE user_id = $1 AND kind = 'github_token' ORDER BY github_owner NULLS FIRST`,
+    [userId],
+  );
 }
 
 export interface AgentSettings {

@@ -27,6 +27,8 @@ export interface WorkspaceRuntime {
   ensure(ws: WorkspaceDirs, network?: NetworkPolicy): Promise<void>;
   /** Kills every process the agent left behind (between runs). */
   recycle(workspaceId: string): Promise<void>;
+  /** Stops the workspace's container (and proxy) to free memory; files are kept and `ensure` starts it again. */
+  stop(workspaceId: string): Promise<void>;
   remove(workspaceId: string): Promise<void>;
   /** Spawns Claude Code inside the workspace, or undefined to spawn on the host. */
   spawnClaude?(workspaceId: string, options: SpawnOptions): SpawnedProcess;
@@ -66,6 +68,7 @@ export const localRuntime: WorkspaceRuntime = {
   repoPathForAgent: (hostRepo) => hostRepo,
   ensure: async () => undefined,
   recycle: async () => undefined,
+  stop: async () => undefined,
   remove: async () => undefined,
 };
 
@@ -142,7 +145,7 @@ const HOST_ONLY_ENV = new Set([
 ]);
 
 /** Bump when apps/runtime changes, so a fresh image is built instead of reusing an old one. */
-export const RUNTIME_REVISION = 'r4';
+export const RUNTIME_REVISION = 'r5';
 
 export function defaultImage(claudeCodeVersion: string): string {
   return `engineering-platform-workspace:${claudeCodeVersion}-${RUNTIME_REVISION}`;
@@ -305,6 +308,12 @@ export class DockerRuntime implements WorkspaceRuntime {
     const name = DockerRuntime.containerName(workspaceId);
     const swept = await run(['exec', '-e', 'PATH=/usr/bin:/bin', name, '/usr/bin/python3', '-I', '-c', SWEEP_SCRIPT, String(openTerminals(workspaceId))], { timeoutMs: 20_000 }).then(() => true, () => false);
     if (!swept) await run(['restart', '-t', '2', name]).catch(() => undefined);
+  }
+
+  async stop(workspaceId: string): Promise<void> {
+    // One call per container: `docker stop a b` fails as a whole when one of them does not exist.
+    await run(['stop', '-t', '5', DockerRuntime.containerName(workspaceId)], { timeoutMs: 60_000 }).catch(() => undefined);
+    await run(['stop', '-t', '2', DockerRuntime.proxyName(workspaceId)], { timeoutMs: 60_000 }).catch(() => undefined);
   }
 
   async remove(workspaceId: string): Promise<void> {

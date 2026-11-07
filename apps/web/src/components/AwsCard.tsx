@@ -9,6 +9,37 @@ interface AwsConfig {
   access: 'read' | 'write';
   externalIdSet: boolean;
   hint: string;
+  /** Enforced with an STS session policy; null = the role's own permissions apply unchanged. */
+  allowedActions: string[] | null;
+  policyPreset: PresetId | 'custom' | null;
+}
+
+type PresetId = 'read-only' | 'deploy';
+type PolicyMode = 'none' | PresetId | 'custom';
+
+interface SessionPolicyPreset {
+  id: PresetId;
+  name: string;
+  description: string;
+  actions: string[];
+}
+
+interface PresetsResponse {
+  presets: SessionPolicyPreset[];
+  maxActions: number;
+  maxPolicyChars: number;
+}
+
+/** Same rules as the API (src/aws/session-policy.ts); the API re-checks everything. */
+const ACTION_RE = /^[a-z0-9-]+:[A-Za-z0-9*]+$/;
+const DEFAULT_LIMITS = { maxActions: 100, maxPolicyChars: 2048 };
+
+function parseActions(text: string): string[] {
+  return [...new Set(text.split(/[\s,]+/).map((a) => a.trim()).filter(Boolean))];
+}
+
+function policySize(actions: string[]): number {
+  return JSON.stringify({ Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: actions, Resource: '*' }] }).length;
 }
 
 const ROLE_ARN_RE = /^arn:aws(-cn|-us-gov)?:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/;
@@ -42,6 +73,7 @@ export function AwsCard({ environments, isOrgAdmin, onChanged }: { environments:
   }, [environments, envId]);
   const env = environments.find((e) => e.id === envId);
   const config = useResource<AwsConfig>(envId ? `/environments/${envId}/aws` : null);
+  const presets = useResource<PresetsResponse>('/aws/session-policy-presets');
   const canEdit = !!env && env.permissions.includes('environment.manage') && (!env.protected || isOrgAdmin);
   const canUse = !!env && env.permissions.includes('environment.use');
 
@@ -53,7 +85,8 @@ export function AwsCard({ environments, isOrgAdmin, onChanged }: { environments:
         <h2 style={{ margin: 0 }}>AWS access</h2>
         <div className="muted" style={{ fontSize: 13 }}>
           A role in the client's AWS account that this environment's workspaces use. Claude and the commands it runs get
-          short-lived credentials for it (never long-lived keys), and every use is recorded in the audit log.
+          short-lived credentials for it (never long-lived keys), optionally narrowed to a list of allowed actions, and every
+          use is recorded in the audit log.
         </div>
       </div>
 
@@ -78,6 +111,7 @@ export function AwsCard({ environments, isOrgAdmin, onChanged }: { environments:
           config={config.data}
           canEdit={canEdit}
           canUse={canUse}
+          presets={presets.data}
           onSaved={async () => { await config.reload(); await onChanged?.(); }}
         />
       )}
@@ -87,12 +121,13 @@ export function AwsCard({ environments, isOrgAdmin, onChanged }: { environments:
   );
 }
 
-function AwsForm({ envId, env, config, canEdit, canUse, onSaved }: {
+function AwsForm({ envId, env, config, canEdit, canUse, presets, onSaved }: {
   envId: string;
   env: EnvironmentRow;
   config: AwsConfig;
   canEdit: boolean;
   canUse: boolean;
+  presets: PresetsResponse | undefined;
   onSaved(): Promise<void>;
 }) {
   const [roleArn, setRoleArn] = useState(config.roleArn ?? '');
@@ -101,8 +136,39 @@ function AwsForm({ envId, env, config, canEdit, canUse, onSaved }: {
   const [region, setRegion] = useState(config.region ?? env.awsRegion ?? '');
   const [sessionSeconds, setSessionSeconds] = useState(config.sessionSeconds);
   const [access, setAccess] = useState<'read' | 'write'>(config.access);
+  const [policyMode, setPolicyMode] = useState<PolicyMode>(config.policyPreset ?? 'none');
+  const [customText, setCustomText] = useState(config.policyPreset === 'custom' ? (config.allowedActions ?? []).join('\n') : '');
   const [saved, setSaved] = useState(false);
   const [test, setTest] = useState<{ account: string; arn: string } | null>(null);
+
+  const limits = presets ?? DEFAULT_LIMITS;
+  const presetById = (id: PolicyMode) => presets?.presets.find((p) => p.id === id);
+  // undefined = keep what is stored (a preset was chosen but the preset list did not load)
+  const allowedActions: string[] | null | undefined =
+    policyMode === 'none' ? null : policyMode === 'custom' ? parseActions(customText) : presetById(policyMode)?.actions;
+  const badActions = allowedActions ? allowedActions.filter((a) => !ACTION_RE.test(a)) : [];
+  const policyChars = allowedActions ? policySize(allowedActions) : 0;
+  const policyProblem = !allowedActions
+    ? null
+    : !allowedActions.length
+      ? 'List at least one action, or choose "Use the role as-is".'
+      : badActions.length
+        ? `Not an AWS action: ${badActions.slice(0, 3).join(', ')}. Use service:Action, e.g. logs:FilterLogEvents or ec2:Describe*.`
+        : allowedActions.length > limits.maxActions
+          ? `At most ${limits.maxActions} actions.`
+          : policyChars > limits.maxPolicyChars
+            ? `Too large for AWS: ${policyChars} of ${limits.maxPolicyChars} characters. Remove actions or use wildcards such as lambda:Get*.`
+            : null;
+
+  const choosePolicy = (mode: PolicyMode) => {
+    // Switching to Custom starts from the list that was selected, so a preset is easy to adjust.
+    if (mode === 'custom' && policyMode !== 'custom' && !customText.trim()) {
+      const from = policyMode === 'none' ? undefined : presetById(policyMode)?.actions;
+      if (from) setCustomText(from.join('\n'));
+    }
+    setPolicyMode(mode);
+    setSaved(false);
+  };
 
   const save = useAction(async () => {
     await api('PUT', `/environments/${envId}/aws`, {
@@ -111,6 +177,7 @@ function AwsForm({ envId, env, config, canEdit, canUse, onSaved }: {
       sessionSeconds,
       access,
       ...(externalId.trim() ? { externalId: externalId.trim() } : {}),
+      ...(allowedActions !== undefined ? { allowedActions } : {}),
     });
     setExternalId('');
     setShowExternalId(false);
@@ -198,7 +265,7 @@ function AwsForm({ envId, env, config, canEdit, canUse, onSaved }: {
               </select>
             </label>
             <label>
-              Access the client gave
+              Access the client gave (label only)
               <select value={access} disabled={!canEdit} onChange={(e) => { setAccess(e.target.value as 'read' | 'write'); setSaved(false); }}>
                 <option value="read">Read-only</option>
                 <option value="write">Read and write</option>
@@ -211,6 +278,20 @@ function AwsForm({ envId, env, config, canEdit, canUse, onSaved }: {
               Longer than 1 hour only works if the client raised the role's maximum session duration (MaxSessionHours in the template).
             </div>
           )}
+
+          <PolicySection
+            canEdit={canEdit}
+            config={config}
+            presets={presets}
+            mode={policyMode}
+            onMode={choosePolicy}
+            customText={customText}
+            onCustomText={(t) => { setCustomText(t); setSaved(false); }}
+            actions={allowedActions}
+            chars={policyChars}
+            maxChars={limits.maxPolicyChars}
+            problem={policyProblem}
+          />
         </>
       )}
 
@@ -220,7 +301,7 @@ function AwsForm({ envId, env, config, canEdit, canUse, onSaved }: {
 
       <div className="form-row">
         {canEdit && (
-          <button className="primary" disabled={save.pending || !arnOk || !regionOk || !externalIdOk}>Save AWS access</button>
+          <button className="primary" disabled={save.pending || !arnOk || !regionOk || !externalIdOk || !!policyProblem}>Save AWS access</button>
         )}
         {config.roleArn && canUse && (
           <button type="button" disabled={testConnection.pending} onClick={() => void testConnection.run()}>
@@ -250,6 +331,77 @@ function AwsForm({ envId, env, config, canEdit, canUse, onSaved }: {
   );
 }
 
+const MODE_LABELS: Record<PolicyMode, string> = {
+  none: 'Use the role as-is',
+  'read-only': 'Read-only investigation',
+  deploy: 'Deploy (Lambda + CloudFormation)',
+  custom: 'Custom list',
+};
+
+/**
+ * Enforced permissions. The platform passes these actions to AWS as a session policy when it
+ * issues credentials; the session gets only what both the role and this list allow.
+ */
+function PolicySection({ canEdit, config, presets, mode, onMode, customText, onCustomText, actions, chars, maxChars, problem }: {
+  canEdit: boolean;
+  config: AwsConfig;
+  presets: PresetsResponse | undefined;
+  mode: PolicyMode;
+  onMode(mode: PolicyMode): void;
+  customText: string;
+  onCustomText(text: string): void;
+  actions: string[] | null | undefined;
+  chars: number;
+  maxChars: number;
+  problem: string | null;
+}) {
+  const preset = presets?.presets.find((p) => p.id === mode);
+  const shown = actions ?? (mode === 'none' ? null : config.allowedActions);
+  return (
+    <div className="stack" style={{ gap: 8 }}>
+      <label>
+        Enforced permissions
+        <select value={mode} disabled={!canEdit} onChange={(e) => onMode(e.target.value as PolicyMode)}>
+          {(['none', 'read-only', 'deploy', 'custom'] as const).map((m) => (
+            <option key={m} value={m}>{presets?.presets.find((p) => p.id === m)?.name ?? MODE_LABELS[m]}</option>
+          ))}
+        </select>
+      </label>
+      <div className="muted" style={{ fontSize: 12.5 }}>
+        {mode === 'none'
+          ? "No session policy: credentials can do everything the client's role allows."
+          : 'Credentials are limited to these actions with an AWS session policy. A session policy can only remove permissions; the role still sets the upper limit.'}
+        {' '}"Access the client gave" is only a label. What is enforced is the role{mode === 'none' ? '' : ' narrowed by this list'}.
+      </div>
+      {preset && <div className="muted" style={{ fontSize: 12.5 }}>{preset.description}</div>}
+
+      {mode === 'custom' && canEdit ? (
+        <label>
+          Allowed actions (one per line)
+          <textarea className="mono" rows={8} value={customText} spellCheck={false}
+            placeholder={'logs:FilterLogEvents\nlogs:Describe*\ncloudwatch:GetMetricData'}
+            onChange={(e) => onCustomText(e.target.value)} />
+        </label>
+      ) : shown && shown.length > 0 ? (
+        <details>
+          <summary style={{ cursor: 'pointer', fontSize: 13 }}>{shown.length} allowed actions</summary>
+          <div className="mono" style={{ fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-all', marginTop: 6 }}>{shown.join('\n')}</div>
+        </details>
+      ) : null}
+
+      {canEdit && actions && actions.length > 0 && (
+        <div className="muted" style={{ fontSize: 12 }}>{actions.length} actions · {chars} of {maxChars} characters</div>
+      )}
+      {canEdit && problem && <div className="error">{problem}</div>}
+      {mode === 'deploy' && (
+        <div className="muted" style={{ fontSize: 12.5 }}>
+          Write actions only work if the client's role allows them (the read-only template does not). Production changes still need an org admin here.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OnboardingHelp() {
   return (
     <details>
@@ -261,7 +413,10 @@ function OnboardingHelp() {
           and the ExternalId (see <code>docs/02-what-to-ask-clients.md</code>, section 2 "AWS access"). They deploy it as a CloudFormation stack in the
           account for this environment.
         </li>
-        <li>Paste the <b>RoleArn</b> from the stack outputs here, choose the region, and save.</li>
+        <li>
+          Paste the <b>RoleArn</b> from the stack outputs here, choose the region and, if wanted, the <b>Enforced permissions</b> preset, then save.
+          For agreed deployments, the draft <code>infra/client-onboarding/deploy-role.yaml</code> is a scoped write role.
+        </li>
         <li>Press <b>Test connection</b>: it should show the client's account number.</li>
       </ol>
       <div className="muted" style={{ fontSize: 12.5, marginTop: 6 }}>

@@ -13,6 +13,7 @@ import { UsagePage } from './pages/UsagePage';
 import { AccountPage } from './pages/AccountPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { HomePage } from './pages/HomePage';
+import { OrgSettingsPage } from './pages/OrgSettingsPage';
 
 // The IDE pulls in Monaco (large); load it only when a workspace is opened.
 const WorkspacePage = lazy(() => import('./pages/WorkspacePage'));
@@ -33,6 +34,7 @@ function App() {
         <Route path="/applications/:id" element={<ApplicationPage />} />
         <Route path="/users" element={<UsersPage />} />
         <Route path="/audit" element={<AuditPage />} />
+        <Route path="/organisation" element={<OrgSettingsPage />} />
         <Route path="/usage" element={<UsagePage />} />
         <Route path="/account" element={<AccountPage />} />
         <Route path="/settings" element={<SettingsPage />} />

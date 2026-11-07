@@ -1,0 +1,237 @@
+# DRAFT: NOT TESTED IN A REAL AWS ACCOUNT. Review with the client before anyone deploys it.
+#
+# Optional write role for deployments of Lambda functions and CloudFormation stacks.
+# Use it only after the client has agreed to write access for a specific environment.
+# The read-only role (readonly-role.yaml) stays the default.
+#
+# How it limits access:
+#   - Trust: only the platform's AWS account, and only with the client's ExternalId.
+#   - Lambda: update/publish only functions and layers whose names start with ResourcePrefix.
+#   - CloudFormation: create/update stacks and change sets only for stacks whose names start
+#     with ResourcePrefix, and only when the stack runs as CloudFormationExecutionRoleArn.
+#     The stack's resources are created by that execution role, not by this role, so this role
+#     needs no permissions for EC2, IAM, DynamoDB and so on. No stack deletion.
+#   - S3: read/write objects only in ArtifactBucketName (deployment packages and templates).
+#   - iam:PassRole: only the execution role, only to CloudFormation.
+#   - The same explicit denies on secret values and data reads as the read-only role.
+#
+# Permissions boundary: the execution role is where the real power sits (it creates whatever
+# the templates describe). The client should scope it to the services the application uses
+# and attach a permissions boundary to it, so stacks cannot create IAM roles or users with
+# more access than the boundary allows. This role can also be given a boundary via the
+# PermissionsBoundaryArn parameter, as a ceiling on top of the policies below.
+#
+# The platform can narrow sessions further with its "Deploy (Lambda + CloudFormation)"
+# session policy preset; a session policy can only remove permissions, never add any.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DRAFT deploy role for the engineering platform: deploys Lambda functions and
+  CloudFormation stacks with a given name prefix, through a client-owned
+  CloudFormation execution role. Cannot delete stacks or read secret values.
+
+Parameters:
+  PlatformAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: AWS account ID of the engineering platform (we send this to you).
+  ExternalId:
+    Type: String
+    MinLength: 16
+    NoEcho: true
+    Description: Shared secret we generate per client, prevents confused-deputy misuse.
+  RoleName:
+    Type: String
+    Default: EngineeringPlatformDeploy
+  MaxSessionHours:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 12
+  ResourcePrefix:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9-]{1,40}$'
+    Description: Name prefix of the Lambda functions, layers and stacks we may deploy (for example "billing-").
+  ArtifactBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Existing S3 bucket for deployment packages and templates.
+  CloudFormationExecutionRoleArn:
+    Type: String
+    AllowedPattern: '^arn:aws(-cn|-us-gov)?:iam::\d{12}:role/.+$'
+    Description: Existing role that CloudFormation uses to create the stack resources. Scope it and give it a permissions boundary.
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: Optional managed policy ARN to use as this role's permissions boundary.
+
+Conditions:
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
+Resources:
+  PlatformDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      MaxSessionDuration: !Ref MaxSessionHours
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${PlatformAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      ManagedPolicyArns:
+        # Lists and describes resources across services. No data-plane reads.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/job-function/ViewOnlyAccess'
+      Policies:
+        - PolicyName: ReadLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+
+        - PolicyName: DeployLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListVersionsByFunction
+                  - lambda:ListAliases
+                  - lambda:GetAlias
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:PublishVersion
+                  - lambda:UpdateAlias
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}*'
+              - Effect: Allow
+                Action:
+                  - lambda:GetLayerVersion
+                  - lambda:PublishLayerVersion
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:layer:${ResourcePrefix}*'
+
+        - PolicyName: DeployCloudFormation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Creating or changing a stack only works when it runs as the execution role.
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ResourcePrefix}*/*'
+                Condition:
+                  StringEquals:
+                    cloudformation:RoleArn: !Ref CloudFormationExecutionRoleArn
+              - Effect: Allow
+                Action:
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ListStackResources
+                  - cloudformation:GetTemplate
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ResourcePrefix}*/*'
+              # AWS SAM templates use the Serverless transform.
+              - Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+              # These calls do not support resource-level permissions.
+              - Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
+
+        - PolicyName: DeploymentArtifacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}'
+
+        - PolicyName: PassExecutionRoleToCloudFormation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Ref CloudFormationExecutionRoleArn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+
+        - PolicyName: DenySensitive
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Explicit denies win over anything attached later.
+              - Effect: Deny
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:BatchGetSecretValue
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                  - ssm:GetParameterHistory
+                  - kms:Decrypt
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PartiQLSelect
+                  - ecs:DescribeTaskDefinition
+                  - cloudformation:DeleteStack
+                Resource: '*'
+              # Object reads only in the artifact bucket.
+              - Effect: Deny
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                NotResource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*'
+              # Lambda configuration (with its environment variables) only for our own functions.
+              - Effect: Deny
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                NotResource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourcePrefix}*'
+
+Outputs:
+  RoleArn:
+    Description: Send this ARN back to us.
+    Value: !GetAtt PlatformDeployRole.Arn

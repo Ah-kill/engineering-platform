@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, type AgentSettings, type GitStatus, type TreeEntry, type Workspace } from '../api';
+import { api, ApiError, type AgentSettings, type GitStatus, type SharedWorkspace, type TreeEntry } from '../api';
+import { useAuth } from '../auth';
 import { useResource } from '../hooks';
 import { FileTree } from '../components/ws/FileTree';
 import { EditorPane, type OpenFile } from '../components/ws/EditorPane';
 import { ChangesPanel } from '../components/ws/ChangesPanel';
 import { ChatPanel } from '../components/ws/ChatPanel';
 import { TerminalPanel } from '../components/ws/TerminalPanel';
+import { SearchPanel } from '../components/ws/SearchPanel';
+import { SharePanel } from '../components/ws/SharePanel';
+import { revealLine } from '../components/ws/reveal';
 
 type MobileTab = 'files' | 'code' | 'claude' | 'changes' | 'terminal';
-type SideTab = 'files' | 'changes';
+type SideTab = 'files' | 'search' | 'changes';
 type BottomTab = 'output' | 'terminal';
 
 function useIsCompact() {
@@ -30,7 +34,10 @@ export default function WorkspacePage() {
   const navigate = useNavigate();
   const [search] = useSearchParams();
   const compact = useIsCompact();
-  const [ws, setWs] = useState<Workspace>();
+  const { me } = useAuth();
+  const [ws, setWs] = useState<SharedWorkspace>();
+  const [filesMode, setFilesMode] = useState<'browse' | 'search'>('browse');
+  const [sharing, setSharing] = useState(false);
   const [wsError, setWsError] = useState<string>();
   const [tree, setTree] = useState<TreeEntry[]>([]);
   const [status, setStatus] = useState<GitStatus>();
@@ -53,7 +60,7 @@ export default function WorkspacePage() {
     let stop = false;
     const load = async () => {
       try {
-        const w = await api<Workspace>('GET', `/workspaces/${wsId}`);
+        const w = await api<SharedWorkspace>('GET', `/workspaces/${wsId}`);
         if (stop) return;
         setWs(w);
         if (w.state === 'creating') setTimeout(load, 1500);
@@ -126,6 +133,12 @@ export default function WorkspacePage() {
     }
   }, [wsId, compact, log]);
 
+  /** Opens a file and moves the cursor to a line (from code search). */
+  const openAt = useCallback(async (path: string, line: number) => {
+    await openFile(path);
+    revealLine(path, line);
+  }, [openFile]);
+
   const saveFile = useCallback(async (path: string) => {
     const f = filesRef.current.find((x) => x.path === path);
     if (!f || f.value === f.saved) return;
@@ -186,8 +199,10 @@ export default function WorkspacePage() {
   }
 
   const changeCount = status?.files.length ?? 0;
+  const readOnly = ws.access === 'viewer';
+  const isOwner = !ws.access || ws.access === 'owner';
 
-  const explorer = (
+  const fileTree = (
     <div className="side-section">
       <input className="file-filter" placeholder="Search files" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Search files" />
       <div className="side-scroll">
@@ -195,24 +210,41 @@ export default function WorkspacePage() {
       </div>
     </div>
   );
+  const codeSearch = <SearchPanel wsId={wsId} onOpen={(p, line) => void openAt(p, line)} />;
+  // On a phone, code search lives inside the Files tab.
+  const explorer = compact ? (
+    <div className="side-section">
+      <div className="segmented small files-mode" role="radiogroup" aria-label="Files or code search">
+        <button role="radio" aria-checked={filesMode === 'browse'} className={filesMode === 'browse' ? 'on' : ''} onClick={() => setFilesMode('browse')}>Browse</button>
+        <button role="radio" aria-checked={filesMode === 'search'} className={filesMode === 'search' ? 'on' : ''} onClick={() => setFilesMode('search')}>Search code</button>
+      </div>
+      {filesMode === 'browse' ? fileTree : codeSearch}
+    </div>
+  ) : fileTree;
   const changes = (
     <div className="side-scroll">
-      <ChangesPanel wsId={wsId} status={status} busy={agentBusy} log={log} onChanged={refreshAll} onOpenDiff={(p) => void openFile(p, 'diff')} />
+      <ChangesPanel wsId={wsId} status={status} busy={agentBusy} log={log} onChanged={refreshAll} onOpenDiff={(p) => void openFile(p, 'diff')} readOnly={readOnly} compact={compact} />
     </div>
   );
   const editor = (
     <EditorPane
-      files={files} active={active} compact={compact} readOnly={agentBusy}
+      files={files} active={active} compact={compact} readOnly={agentBusy || readOnly}
       onSelect={setActive} onClose={closeFile} onSave={(p) => void saveFile(p)} onToggleView={(p) => void toggleView(p)}
       onChange={(p, v) => setFiles((fs) => fs.map((f) => (f.path === p ? { ...f, value: v } : f)))}
     />
   );
-  // The terminal mounts (and connects) only once its tab is opened, then stays mounted.
+  // The terminal mounts (and connects) only once its tab is opened, then stays mounted. Viewers get none.
   const terminalShown = compact ? mobileTab === 'terminal' : bottomTab === 'terminal';
-  const terminal = <TerminalPanel key={compact ? 'phone' : 'desktop'} wsId={wsId} active={terminalShown} compact={compact} />;
-  const chat = (
+  const terminal = readOnly ? null : <TerminalPanel key={compact ? 'phone' : 'desktop'} wsId={wsId} active={terminalShown} compact={compact} />;
+  const chat = readOnly ? (
+    <div className="panel-pad muted viewer-note">
+      <p style={{ marginTop: 0 }}>You can view this workspace. {ws.ownerName} shared it with you.</p>
+      <p style={{ marginBottom: 0 }}>Running Claude, editing, committing and the terminal need edit access. Ask the owner if you need it.</p>
+    </div>
+  ) : (
     <ChatPanel wsId={wsId} initialSessionId={search.get('session')} defaultModel={settings.data?.defaultModel ?? 'default'} onRunFinished={onRunFinished} onRunningChange={setAgentBusy} />
   );
+  const mobileTabs: MobileTab[] = readOnly ? ['files', 'code', 'claude', 'changes'] : ['files', 'code', 'claude', 'changes', 'terminal'];
 
   return (
     <div className={`ide${compact ? ' compact' : ''}`}>
@@ -220,12 +252,17 @@ export default function WorkspacePage() {
         <Link to={`/applications/${ws.applicationId}`} className="ide-back" aria-label="Back to application">‹</Link>
         <div className="ide-title">
           <div className="ide-crumbs muted">{ws.clientName} / {ws.applicationName}</div>
-          <div className="ide-branch"><code>{status?.branch ?? ws.branch}</code> <span className={`badge${ws.environmentKind === 'production' ? ' warn' : ''}`}>{ws.environmentName}</span></div>
+          <div className="ide-branch">
+            <code>{status?.branch ?? ws.branch}</code> <span className={`badge${ws.environmentKind === 'production' ? ' warn' : ''}`}>{ws.environmentName}</span>
+            {!isOwner && <> <span className="badge" title={`Shared by ${ws.ownerName}`}>{readOnly ? 'view only' : 'shared'}</span></>}
+          </div>
         </div>
         <span style={{ flex: 1 }} />
         {!compact && <button className="small" onClick={() => void refreshAll()}>Refresh</button>}
-        <button className="small danger" onClick={() => void deleteWorkspace()}>Delete</button>
+        <button className="small" onClick={() => setSharing(true)}>{isOwner ? 'Share' : 'People'}</button>
+        {isOwner && <button className="small danger" onClick={() => void deleteWorkspace()}>Delete</button>}
       </header>
+      {sharing && me && <SharePanel wsId={wsId} userId={me.user.id} applicationId={ws.applicationId} onClose={() => setSharing(false)} />}
 
       {compact ? (
         <>
@@ -234,10 +271,10 @@ export default function WorkspacePage() {
             <div hidden={mobileTab !== 'code'} className="fill">{editor}</div>
             <div hidden={mobileTab !== 'claude'} className="fill">{chat}</div>
             <div hidden={mobileTab !== 'changes'} className="fill">{changes}</div>
-            <div hidden={mobileTab !== 'terminal'} className="fill">{terminal}</div>
+            {terminal && <div hidden={mobileTab !== 'terminal'} className="fill">{terminal}</div>}
           </div>
           <nav className="ide-tabbar" aria-label="Workspace">
-            {(['files', 'code', 'claude', 'changes', 'terminal'] as MobileTab[]).map((t) => (
+            {mobileTabs.map((t) => (
               <button key={t} className={mobileTab === t ? 'on' : ''} onClick={() => setMobileTab(t)} aria-current={mobileTab === t}>
                 {t === 'files' ? 'Files' : t === 'code' ? 'Code' : t === 'claude' ? 'Claude' : t === 'terminal' ? 'Terminal' : `Changes${changeCount ? ` (${changeCount})` : ''}`}
               </button>
@@ -249,23 +286,24 @@ export default function WorkspacePage() {
           <aside className="ide-side">
             <div className="side-tabs" role="tablist">
               <button role="tab" aria-selected={sideTab === 'files'} className={sideTab === 'files' ? 'on' : ''} onClick={() => setSideTab('files')}>Files</button>
+              <button role="tab" aria-selected={sideTab === 'search'} className={sideTab === 'search' ? 'on' : ''} onClick={() => setSideTab('search')}>Search</button>
               <button role="tab" aria-selected={sideTab === 'changes'} className={sideTab === 'changes' ? 'on' : ''} onClick={() => setSideTab('changes')}>
                 Changes{changeCount ? ` (${changeCount})` : ''}
               </button>
             </div>
-            {sideTab === 'files' ? explorer : changes}
+            {sideTab === 'files' ? explorer : sideTab === 'search' ? codeSearch : changes}
           </aside>
           <main className="ide-main">
             {editor}
             <div className={`ide-bottom${bottomTab === 'terminal' ? ' terminal' : ''}`}>
               <div className="bottom-tabs" role="tablist" aria-label="Bottom panel">
                 <button role="tab" aria-selected={bottomTab === 'output'} className={bottomTab === 'output' ? 'on' : ''} onClick={() => setBottomTab('output')}>Output</button>
-                <button role="tab" aria-selected={bottomTab === 'terminal'} className={bottomTab === 'terminal' ? 'on' : ''} onClick={() => setBottomTab('terminal')}>Terminal</button>
+                {terminal && <button role="tab" aria-selected={bottomTab === 'terminal'} className={bottomTab === 'terminal' ? 'on' : ''} onClick={() => setBottomTab('terminal')}>Terminal</button>}
               </div>
               <div className="ide-log mono" aria-label="Output" hidden={bottomTab !== 'output'}>
                 {logLines.length ? logLines.map((l, i) => <div key={i}>{l}</div>) : <div className="muted">Git and file output appears here.</div>}
               </div>
-              <div className="ide-term" hidden={bottomTab !== 'terminal'}>{terminal}</div>
+              {terminal && <div className="ide-term" hidden={bottomTab !== 'terminal'}>{terminal}</div>}
             </div>
           </main>
           <section className="ide-chat">{chat}</section>

@@ -22,6 +22,7 @@ import {
   TEST_SESSION_SECONDS,
   type AwsIssuePlan,
 } from './aws.js';
+import { MAX_SESSION_POLICY_CHARS, MAX_ALLOWED_ACTIONS, SESSION_POLICY_PRESETS } from './session-policy.js';
 import { getStsClient, stsError, type StsClient } from './sts.js';
 
 const envParam = z.object({ id: z.string().uuid() });
@@ -32,6 +33,9 @@ const putBody = z
     region: z.string().trim().regex(REGION_RE, 'Not a valid AWS region, e.g. eu-west-1'),
     sessionSeconds: z.number().int().min(MIN_SESSION_SECONDS).max(MAX_SESSION_SECONDS).default(DEFAULT_SESSION_SECONDS),
     access: z.enum(['read', 'write']).default('read'),
+    // Enforced permissions (STS session policy). Omitted = keep; null = none (role as-is).
+    // Shape only here; saveAwsConfig checks each action, the count and the policy size with clear messages.
+    allowedActions: z.array(z.string().max(256)).max(1000).nullable().optional(),
   })
   .strict(); // rejects anything else, in particular AWS access keys
 
@@ -48,12 +52,19 @@ async function requireManage(q: Queryable, user: AuthUser, environmentId: string
 }
 
 /**
- * GET/PUT/DELETE /environments/:id/aws and POST /environments/:id/aws/test.
+ * GET/PUT/DELETE /environments/:id/aws, POST /environments/:id/aws/test and
+ * GET /aws/session-policy-presets.
  * STS is resolved per request: the `sts` argument, then `deps.sts`, then `setStsClient()`, then the real SDK.
  */
 export async function awsRoutes(app: FastifyInstance, deps: RouteDeps, sts?: StsClient) {
   const { db, vault } = deps;
   const stsClient = () => sts ?? (deps as RouteDeps & { sts?: StsClient }).sts ?? getStsClient();
+
+  /** Session policy presets for the UI. Not secret; any signed-in user may read them. */
+  app.get('/aws/session-policy-presets', async (req) => {
+    caller(req);
+    return { presets: SESSION_POLICY_PRESETS, maxActions: MAX_ALLOWED_ACTIONS, maxPolicyChars: MAX_SESSION_POLICY_CHARS };
+  });
 
   app.get('/environments/:id/aws', async (req) => {
     const { user } = caller(req);
@@ -75,7 +86,12 @@ export async function awsRoutes(app: FastifyInstance, deps: RouteDeps, sts?: Sts
         orgId: user.orgId, actorId: user.id, action: 'aws.config.updated', resourceType: 'environment', resourceId: id,
         clientId: chain.clientId, applicationId: chain.applicationId, environmentId: id,
         // never the ExternalId itself
-        details: { roleArn: body.roleArn, region: body.region, sessionSeconds: body.sessionSeconds, access: body.access, externalIdChanged: body.externalId !== undefined },
+        details: {
+          roleArn: body.roleArn, region: body.region, sessionSeconds: body.sessionSeconds, access: body.access,
+          externalIdChanged: body.externalId !== undefined,
+          policyPreset: view.policyPreset ?? 'none',
+          allowedActions: view.allowedActions,
+        },
       });
       return view;
     });

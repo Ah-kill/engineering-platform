@@ -2,7 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { audit } from '../audit/audit.js';
 import { caller, type RouteDeps } from '../http/app.js';
-import { CREDENTIAL_KINDS, MODEL_ID, readAgentSettings, saveCredential, validateCredential } from './credentials.js';
+import { HttpError } from '../http/errors.js';
+import { listUserRepos } from '../git/github.js';
+import {
+  CREDENTIAL_KINDS, deleteCredential, listGithubTokens, MODEL_ID, normaliseGithubOwner, readAgentSettings, readGithubToken,
+  saveCredential, validateCredential,
+} from './credentials.js';
 
 const settingsBody = z
   .object({
@@ -12,17 +17,22 @@ const settingsBody = z
   .partial();
 
 const kindParam = z.object({ kind: z.enum(CREDENTIAL_KINDS) });
-const credentialBody = z.object({ value: z.string().min(1).max(4096) });
+/** `owner` (GitHub tokens only): the organization or user the token is for; omitted = default token. */
+const credentialBody = z.object({ value: z.string().min(1).max(4096), owner: z.string().max(39).optional() });
+const ownerQuery = z.object({ owner: z.string().max(39).optional() });
 
 export async function settingsRoutes(app: FastifyInstance, { db, vault }: RouteDeps) {
 
-  /** The caller's agent settings and which credentials are saved (hints only, never values). */
+  /**
+   * The caller's agent settings and which credentials are saved (hints only, never values).
+   * `credentials.github_token` is the default token; `githubTokens` lists every GitHub token by owner.
+   */
   app.get('/me/settings', async (req) => {
     const { user } = caller(req);
     return db.tenant(user.orgId, async (q) => {
       const settings = await readAgentSettings(q, user.id);
       const creds = await q.query<{ kind: string; hint: string; updated_at: Date }>(
-        'SELECT kind, hint, updated_at FROM user_credentials WHERE user_id = $1',
+        'SELECT kind, hint, updated_at FROM user_credentials WHERE user_id = $1 AND github_owner IS NULL',
         [user.id],
       );
       const credentials = Object.fromEntries(
@@ -31,7 +41,7 @@ export async function settingsRoutes(app: FastifyInstance, { db, vault }: RouteD
           return [k, c ? { saved: true, hint: c.hint, updatedAt: c.updated_at } : { saved: false }];
         }),
       );
-      return { ...settings, credentials };
+      return { ...settings, credentials, githubTokens: await listGithubTokens(q, user.id) };
     });
   });
 
@@ -54,10 +64,16 @@ export async function settingsRoutes(app: FastifyInstance, { db, vault }: RouteD
   app.put('/me/credentials/:kind', async (req) => {
     const { user } = caller(req);
     const { kind } = kindParam.parse(req.params);
-    const value = validateCredential(kind, credentialBody.parse(req.body).value);
+    const body = credentialBody.parse(req.body);
+    const value = validateCredential(kind, body.value);
+    const owner = normaliseGithubOwner(body.owner);
+    if (owner && kind !== 'github_token') throw HttpError.badRequest('Only GitHub tokens can be saved per owner');
     await db.tenant(user.orgId, async (q) => {
-      await saveCredential(q, vault, user.orgId, user.id, kind, value);
-      await audit(q, { orgId: user.orgId, actorId: user.id, action: 'credential.saved', resourceType: 'user', resourceId: user.id, details: { kind } });
+      await saveCredential(q, vault, user.orgId, user.id, kind, value, owner);
+      await audit(q, {
+        orgId: user.orgId, actorId: user.id, action: 'credential.saved', resourceType: 'user', resourceId: user.id,
+        details: { kind, ...(owner ? { githubOwner: owner } : {}) },
+      });
     });
     return { ok: true };
   });
@@ -65,10 +81,26 @@ export async function settingsRoutes(app: FastifyInstance, { db, vault }: RouteD
   app.delete('/me/credentials/:kind', async (req) => {
     const { user } = caller(req);
     const { kind } = kindParam.parse(req.params);
+    const owner = normaliseGithubOwner(ownerQuery.parse(req.query).owner);
     await db.tenant(user.orgId, async (q) => {
-      await q.query('DELETE FROM user_credentials WHERE user_id = $1 AND kind = $2', [user.id, kind]);
-      await audit(q, { orgId: user.orgId, actorId: user.id, action: 'credential.deleted', resourceType: 'user', resourceId: user.id, details: { kind } });
+      await deleteCredential(q, user.id, kind, owner);
+      await audit(q, {
+        orgId: user.orgId, actorId: user.id, action: 'credential.deleted', resourceType: 'user', resourceId: user.id,
+        details: { kind, ...(owner ? { githubOwner: owner } : {}) },
+      });
     });
     return { ok: true };
+  });
+
+  /**
+   * Repositories the caller's GitHub token can reach, for the repository picker. With
+   * `owner`, uses that owner's token (or the default one) and lists only its repositories.
+   */
+  app.get('/me/github/repos', async (req) => {
+    const { user } = caller(req);
+    const owner = normaliseGithubOwner(ownerQuery.parse(req.query).owner);
+    const token = await db.tenant(user.orgId, (q) => readGithubToken(q, vault, user.id, owner));
+    if (!token) throw HttpError.badRequest('Add a GitHub token in Settings to list your repositories');
+    return listUserRepos(token, owner ?? undefined);
   });
 }

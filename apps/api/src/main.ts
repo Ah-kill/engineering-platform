@@ -7,6 +7,7 @@ import { migrate } from './db/migrate.js';
 import { buildApp } from './http/app.js';
 import { Vault } from './vault/vault.js';
 import { readSdkPackage } from './agents/version.js';
+import { startIdleReaper } from './agents/housekeeping.js';
 import { defaultImage, DockerRuntime, localRuntime, type WorkspaceRuntime } from './workspaces/runtime.js';
 
 const config = loadConfig();
@@ -55,7 +56,16 @@ if (config.SERVE_WEB) {
   if (new URL(config.WEB_ORIGIN).port === '5173') app.log.warn('SERVE_WEB=true but WEB_ORIGIN still points at the Vite dev server; set it to the public URL');
 }
 
+// Stop the containers of workspaces nobody has used for a while (files are kept; the next
+// request starts the container again). Never while Claude runs or a terminal is open.
+const stopReaper =
+  config.WORKSPACE_IDLE_MINUTES > 0
+    ? startIdleReaper(db, runtime, { idleMinutes: config.WORKSPACE_IDLE_MINUTES, log: app.log })
+    : () => undefined;
+if (config.WORKSPACE_IDLE_MINUTES > 0) app.log.info(`idle workspace containers stop after ${config.WORKSPACE_IDLE_MINUTES} minutes`);
+
 const shutdown = async () => {
+  stopReaper();
   await app.close();
   await db.close();
   process.exit(0);

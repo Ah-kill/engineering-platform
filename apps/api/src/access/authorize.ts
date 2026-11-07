@@ -143,6 +143,7 @@ const ALL_PERMISSIONS: Permission[] = [
   'application.view',
   'application.update',
   'application.archive',
+  'application.merge',
   'environment.view',
   'environment.manage',
   'environment.use',

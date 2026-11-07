@@ -1,0 +1,38 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: [dependencies]
+    commit-message:
+      prefix: deps
+    groups:
+      # Claude Code ships inside the Agent SDK. Its own PR, because merging it also needs
+      # `npm run runtime:build` (new workspace image); see "Keeping Claude Code up to date".
+      claude-agent-sdk:
+        patterns: ['@anthropic-ai/claude-agent-sdk']
+      # Editor stack: Monaco pins its own DOMPurify (see the override in package.json).
+      editor:
+        patterns: ['monaco-editor', '@monaco-editor/*', '@xterm/*']
+      dev-dependencies:
+        dependency-type: development
+        update-types: [minor, patch]
+      production:
+        dependency-type: production
+        update-types: [minor, patch]
+        exclude-patterns: ['@anthropic-ai/claude-agent-sdk', 'monaco-editor', '@monaco-editor/*', '@xterm/*']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies]
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ['*']

@@ -189,4 +189,5 @@ export async function identityRoutes(app: FastifyInstance, deps: RouteDeps) {
   );
 
   await mfaRoutes(app, deps);
+  await (await import('./session-routes.js')).sessionRoutes(app, deps);
 }

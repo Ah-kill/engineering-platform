@@ -1,9 +1,44 @@
 # Engineering Platform: Phase 1 Architecture and Research
 
-Status: revised 2026-11-05 after review (see section 0). Phase 1 Foundation is implemented.
-Scope: research, architecture, security model, tenancy, schema, roadmap, risks. No application code yet.
+Status: revised 2026-11-05 after review (see section 0); implementation status updated 2026-11-07 (see "Current implementation" below).
+Scope: research, architecture, security model, tenancy, schema, roadmap, risks. Sections 1 to 12 are the original target design written before any code; where the code differs, the section below says so and wins.
 
 Evidence note: the open-source review below is based on each project's LICENSE file, GitHub metadata and README, read on 2026-11-04. I did not audit source code. Every "reuse" claim is therefore a hypothesis to confirm in a time-boxed spike (see section 11), not a finding.
+
+---
+
+## Current implementation (Nov 2026)
+
+> This section describes what is built, checked against the code on 2026-11-07. The rest of the
+> document is the original target. The API is listed endpoint by endpoint in [04-api.md](04-api.md).
+
+### Built versus target
+
+| Area | Original target | Built now | Gap / next step |
+|------|-----------------|-----------|-----------------|
+| Shape | Control plane plus separate execution worker on dedicated hosts | One Node process (Fastify 5 API, serves the Vite/React app in production) that starts Docker containers on the same host | Move workspace containers to a second machine once many clients' credentials are held (section 0.3, `docs/03`) |
+| Repo tooling | pnpm + Turborepo, NestJS, Next.js | npm workspaces (`apps/api`, `apps/web`, `apps/runtime`), Fastify, Vite + React Router | None needed at this size |
+| Database | Postgres with RLS | Embedded PGlite or any Postgres via `DATABASE_URL`; numbered SQL migrations; requests run as `platform_app` with `app.org_id` set per transaction and RLS on every tenant table | Monthly partitioning of `audit_events` when it grows |
+| Login | Email/password, then TOTP, OIDC later | Argon2id passwords; hashed session tokens in httpOnly SameSite=Strict cookies; custom header + Origin check on changes; login rate limit. **Two-step login**: TOTP (RFC 6238, replay-protected) with 10 single-use recovery codes, per-user lockout after 10 wrong codes (15 min), admin reset. Users list and revoke their own sessions | OIDC/SSO; WebAuthn/passkeys |
+| Authorization | `can()` over a grants table, no implicit admin data access | As designed: one pure policy function, grants on client/application/environment, protected (production) environments need an exact-environment grant given by an org admin | Time-boxed grants exist in the schema; no UI to set expiry yet |
+| Credentials at rest | KMS envelope encryption, Secrets Manager references | **Local vault**: AES-256-GCM with one key (`VAULT_KEY` or a generated key file). Developer Claude/GitHub credentials, environment secrets, AWS ExternalIds and TOTP secrets are stored as ciphertext and shown only as hints | KMS-wrapped data key; Secrets Manager references for client secrets |
+| Git | GitHub App, control plane pushes | Per-developer fine-grained PATs (per GitHub owner). Fetch, pull and push run in the control plane only while Claude is idle, after an allowlist check of `.git/config`, with dangerous git settings forced off; the token never enters the container. Push to default/protected branches refused; PRs via the GitHub API | GitHub App installation tokens |
+| Sandbox | gVisor/Sysbox, rootless, dedicated hosts | **Docker** container per workspace: uid 1000, all capabilities dropped, `no-new-privileges`, read-only root, CPU/memory/PID limits, git directory mounted read-only, no Docker socket or host folders, restarted after each run (ends background processes). Tested in `apps/api/test/docker.test.ts` | gVisor (`runsc`) runtime and a separate worker host |
+| Network | Default deny, egress proxy with allowlist | **Restricted by default**: each workspace sits on an `--internal` Docker network whose only exit is a per-workspace egress proxy container that allows Anthropic, GitHub, npm/yarn, PyPI, the application's extra hosts and, when an AWS role is set, that region's AWS endpoints. Per application an app admin may switch to *open* | Docker bridge gateway still reachable (keep host services password-protected and on localhost); no egress logging yet |
+| Agent | Agent SDK, plan/execute, approvals, cost | Claude Agent SDK in the container; plan mode, execute mode, tool policy outside the model (allow / deny / ask the developer), 15-minute approval timeout, cancel, SSE event stream with replay, per-run turn, time and cost limits; per-application project instructions (set by app admins) that a repository's `CLAUDE.md` cannot override | Separate approver (two-key) for production-affecting actions |
+| Agent credentials | Container never holds long-lived credentials (D4) | Partly: GitHub tokens and platform secrets never enter it; **the developer's own Claude credential does** (needed by Claude Code), as in a local terminal | Anthropic auth via an injecting proxy |
+| Terminal | PTY terminal | WebSocket terminal into the workspace container (never the host): Origin-checked upgrade, max 3 per workspace, 60-minute idle limit, backpressure, environment variables and short-lived AWS credentials but no Claude/GitHub credentials; open/close audited, contents not logged | Session recording (deliberately not done) |
+| Secrets for apps | Secrets Manager per client/app/env | Per-environment variables and secrets in the database (secrets encrypted), `.env` import, redacted from stored and streamed agent output | Secrets Manager references, rotation |
+| AWS broker | STS AssumeRole with ExternalId, read-only v1, session policy | Per-environment role ARN, encrypted ExternalId (required), region, session length (15 min to 12 h); STS credentials issued per Claude run and per terminal, never stored; connection test; optional enforced **session policy** (allowed IAM actions, presets) that can only narrow the role | Approval workflow for write roles |
+| Usage and cost | Usage records, per-user and per-app budgets | Usage page: cost and tokens per day, developer, application and model (admins see the org, developers themselves). **Monthly budget per developer** (org default plus per-developer override) with `checkMonthlyBudget`; per-run cap `AGENT_MAX_BUDGET_USD` | Wire the monthly check into every run start (see `docs/04`), per-application budgets |
+| Audit | Append-only, export to S3 with object lock | Append-only table (`platform_app` has INSERT/SELECT only), written in the same transaction as the change; admin page with filters (action group, outcome, actor, environment, workspace, dates); streamed, formula-safe CSV export (itself audited) | Scheduled export to object-locked storage |
+| Operations | Terraform, CI/CD, monitoring | Deployment guide for one VM (systemd, Caddy or Tailscale, backups, restore drill) in `docs/03`; GitHub Actions CI (typecheck, API tests incl. Docker tests, web build, `npm audit`, Playwright on desktop and phone); Dependabot for npm and Actions | Uptime and log alerting |
+
+### Not built (still target only)
+
+GitHub App, OIDC/SSO, KMS and Secrets Manager, gVisor and dedicated worker hosts, two-person
+approvals, idempotency keys, app templates and infrastructure proposals (section 4.4), audit export
+to object storage, additional Git providers.
 
 ---
 
@@ -285,20 +320,25 @@ Never-do list: no Docker socket in any container; no host mounts of `~/.ssh`, `~
 
 ### 6.4 Threat model (abbreviated)
 
-| Threat | Example | Mitigation |
-|--------|---------|------------|
-| Cross-tenant data access | Developer A reads client B's repo or secrets | Grants checked per resource, Postgres RLS on org scope, per-app credentials, tests that assert denial |
-| Prompt injection | Malicious README tells the agent to print secrets or push code | Agent holds no credentials, cannot push, egress allowlist, tool policy outside model, approvals for risky tools |
-| Sandbox escape | Hostile repo build script attacks the host | gVisor/Sysbox, rootless, dedicated worker hosts, no sockets mounted |
-| SSRF | User supplies a Git URL pointing at internal services | Validate URLs, resolve and block private ranges, use fixed provider adapters |
-| Credential theft from the platform | DB dump exposes tokens | KMS envelope encryption, secret values never in DB, short-lived tokens |
-| Privilege escalation via role design | Org admin silently reads prod secrets | Admin can administer but secret-read is a separate grant, audited |
-| Confused deputy | Agent asks the broker for another environment's credentials | Broker binds each request to the session's (app, env) and the requesting user's grants |
-| Insider misuse | Developer pushes to protected branch | Branch protection plus platform approval, audit |
-| Supply chain | Malicious dependency in a client repo | Runs in the sandbox with no credentials; dependency scanning in CI |
-| Denial of service | Runaway agent or fork bomb | Resource limits, per-user and per-app quotas, budgets |
-| Log leakage | Secret appears in terminal output | Output redaction from known secret values plus pattern rules; best-effort, so values are not injected unless required |
-| Audit tampering | Admin edits audit rows | Append-only table, restricted DB role, periodic export to S3 with object lock |
+Updated 2026-11-07: "Mitigation now" is what the code does today; "Residual risk" is what is left
+and what would reduce it. The original target mitigations are in the third column.
+
+| Threat | Example | Target mitigation | Mitigation now | Residual risk |
+|--------|---------|-------------------|----------------|---------------|
+| Cross-tenant data access | Developer A reads client B's repo or secrets | Grants checked per resource, Postgres RLS on org scope, per-app credentials, tests that assert denial | One policy function on every route (404 when not visible, 403 when visible but not allowed), RLS on every tenant table via `platform_app`, composite org foreign keys, workspaces per owner (sharing still needs `environment.use`), denial tests per endpoint | A policy bug inside one org is not stopped by RLS (RLS is per org, not per client). Keep the denial tests growing with every endpoint |
+| Prompt injection | Malicious README tells the agent to print secrets or push code | Agent holds no credentials, cannot push, egress allowlist, tool policy outside model, approvals for risky tools | Tool policy outside the model (no push, no git config, no credential reads, risky commands need the developer's approval), restricted egress by default, GitHub token never in the container, repository settings and hooks not loaded, redaction of known secrets | The developer's own Claude credential and the environment's variables and short-lived AWS credentials are readable by commands Claude runs; an allowed host (e.g. GitHub, npm) can still be an exfiltration channel. Approvals rely on the developer reading them |
+| Sandbox escape | Hostile repo build script attacks the host | gVisor/Sysbox, rootless, dedicated worker hosts, no sockets mounted | Docker with uid 1000, no capabilities, `no-new-privileges`, read-only root, resource limits, no Docker socket or host mounts, read-only git directory; Docker escape tests | Plain Docker shares the host kernel, and the container runs on the same machine as the database and vault key. Next: gVisor and a separate workspace host before holding many clients' credentials |
+| Network pivot from a workspace | Code in the container probes the host or other services | Default-deny network, block metadata and internal ranges | Restricted mode: internal network per workspace, egress only through a per-workspace allowlist proxy; open mode is an explicit, audited per-application choice | In open mode, or via the Docker bridge gateway, host services are reachable: keep databases password-protected and bound to localhost; never run the platform on a cloud VM with an unprotected metadata endpoint |
+| SSRF | User supplies a Git URL pointing at internal services | Validate URLs, resolve and block private ranges, use fixed provider adapters | Only `github.com/owner/repo` (strictly parsed) is accepted; clone URLs are built by the platform; network hosts must be DNS names (no IPs, no URLs) | Low. A future provider adapter must keep the same rule |
+| Credential theft from the platform | DB dump exposes tokens | KMS envelope encryption, secret values never in DB, short-lived tokens | AES-256-GCM vault for every stored credential and secret, hints only in the API, session and recovery-code hashes only, AWS access via short-lived STS credentials and an encrypted ExternalId, no AWS keys accepted | One local key decrypts everything: a server compromise that reads both the database and `VAULT_KEY` exposes all saved credentials. Next: KMS-wrapped key; keep backups of the key apart from dumps |
+| Account takeover | Stolen password or session cookie | OIDC, MFA | Argon2id, login rate limit, two-step login with lockout and recovery codes, httpOnly SameSite=Strict cookies, CSRF header + Origin check, sessions revoked on password/MFA change, users can see and revoke their devices | Two-step login is optional per user (not enforced by policy yet); no SSO or passkeys; sessions do not record last use |
+| Privilege escalation via role design | Org admin silently reads prod secrets | Admin can administer but secret-read is a separate grant, audited | Org admins manage but get no `environment.use`; secret values are never returned by the API to anyone; only org admins grant production access or change production variables, AWS and protection; everything audited | An org admin can grant themselves production access (audited, visible in the log). Two-person rule not built |
+| Confused deputy | Agent asks the broker for another environment's credentials | Broker binds each request to the session's (app, env) and the requesting user's grants | AWS credentials are issued by the platform per run/terminal for the workspace's own environment after an `environment.use` check, with a required ExternalId and optional session policy | Credentials live for the configured session length (15 min to 12 h) inside the container once issued |
+| Insider misuse | Developer pushes to protected branch | Branch protection plus platform approval, audit | Pushes to default and well-known protected branches refused; PRs instead; audit log with filters and CSV export | Relies on the client's GitHub branch protection for anything beyond those names. Audit is reviewed manually |
+| Supply chain | Malicious dependency in a client repo | Runs in the sandbox with no credentials; dependency scanning in CI | Installs run in the container behind the egress allowlist; platform's own dependencies checked by `npm audit` in CI and Dependabot | See prompt injection: the container does hold the developer's Claude credential and environment values |
+| Denial of service and cost | Runaway agent or fork bomb | Resource limits, per-user and per-app quotas, budgets | CPU, memory and PID limits per container, per-run turn and cost caps, 3 terminals per workspace, monthly budget per developer (org default and override) | Monthly budget enforcement must be wired into run start (see `docs/04`); no per-application budget; one host shared by all workspaces |
+| Log leakage | Secret appears in terminal output | Output redaction from known secret values plus pattern rules; best-effort, so values are not injected unless required | Known secret values redacted from stored and streamed agent events; terminal contents never stored; audit details drop sensitive keys; request logs redact cookies and auth headers | Redaction is best-effort (encoded or partial values pass) |
+| Audit tampering | Admin edits audit rows | Append-only table, restricted DB role, periodic export to S3 with object lock | `platform_app` may only INSERT and SELECT; events commit with the change they describe; exports are themselves audited | The database owner role (and a server compromise) can still alter rows. Next: scheduled export to object-locked storage |
 
 Residual risk worth saying plainly: redaction is best-effort. The primary control is not giving the agent secrets in the first place.
 

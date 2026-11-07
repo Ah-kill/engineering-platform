@@ -1,12 +1,12 @@
 import { mkdir, rm } from 'node:fs/promises';
-import { requirePermission } from '../access/authorize.js';
+import { authorize, requirePermission } from '../access/authorize.js';
 import type { Database, Queryable } from '../db/db.js';
 import { HttpError } from '../http/errors.js';
 import type { AuthUser } from '../identity/sessions.js';
 import { principalOf } from '../identity/user-routes.js';
 import { cloneUrl } from '../git/github.js';
 import { assertBranch, runGit } from '../git/git.js';
-import { readCredential } from '../settings/credentials.js';
+import { readGithubToken } from '../settings/credentials.js';
 import type { Vault } from '../vault/vault.js';
 import { workspacePaths } from './paths.js';
 import { separateGitDir, type NetworkPolicy, type WorkspaceRuntime } from './runtime.js';
@@ -37,11 +37,29 @@ export interface WorkspaceRow {
   egressHosts: string[];
   awsRegion: string | null;
   awsConfigured: boolean;
+  ownerName: string;
+  /** The caller's access: they own it, or it was shared with them as editor or viewer. */
+  access: WorkspaceRole;
 }
 
+/** What a user may do in a workspace. Owner: everything. Editor: all but delete and sharing. Viewer: read only. */
+export type WorkspaceRole = 'owner' | 'editor' | 'viewer';
+/** The access a request needs: read (any member), write (owner or editor), owner. */
+export type WorkspaceAccess = 'read' | 'write' | 'owner';
+
+const SATISFIES: Record<WorkspaceAccess, readonly WorkspaceRole[]> = {
+  read: ['owner', 'editor', 'viewer'],
+  write: ['owner', 'editor'],
+  owner: ['owner'],
+};
+
+/** `$2` must be the caller's user id: computes their role (or NULL when they have none). */
 const WS_SELECT = `
   SELECT w.id, w.org_id AS "orgId", w.application_id AS "applicationId", w.environment_id AS "environmentId",
-         w.repository_id AS "repositoryId", w.owner_id AS "ownerId", w.branch, w.base_branch AS "baseBranch",
+         w.repository_id AS "repositoryId", w.owner_id AS "ownerId", ou.display_name AS "ownerName",
+         CASE WHEN w.owner_id = $2 THEN 'owner'
+              ELSE (SELECT m.role FROM workspace_members m WHERE m.workspace_id = w.id AND m.user_id = $2) END AS access,
+         w.branch, w.base_branch AS "baseBranch",
          w.state, w.error, w.created_at AS "createdAt", w.last_active_at AS "lastActiveAt",
          r.owner AS "repoOwner", r.name AS "repoName", r.default_branch AS "defaultBranch",
          a.name AS "applicationName", a.client_id AS "clientId", c.name AS "clientName",
@@ -52,27 +70,60 @@ const WS_SELECT = `
     JOIN repositories r ON r.id = w.repository_id
     JOIN applications a ON a.id = w.application_id
     JOIN clients c ON c.id = a.client_id
-    JOIN environments e ON e.id = w.environment_id`;
+    JOIN environments e ON e.id = w.environment_id
+    JOIN users ou ON ou.id = w.owner_id`;
 
 /** Resolves the git remote for a repository. Overridable in tests (local bare repos). */
 export type RemoteResolver = (owner: string, name: string) => string;
 export const githubRemote: RemoteResolver = cloneUrl;
 
+/**
+ * The caller's workspaces in an application: their own and those shared with them, as long
+ * as they still hold `environment.use` on the workspace's environment.
+ */
 export async function listWorkspaces(q: Queryable, user: AuthUser, applicationId: string): Promise<WorkspaceRow[]> {
-  return q.query<WorkspaceRow>(
-    `${WS_SELECT} WHERE w.application_id = $1 AND w.owner_id = $2 AND w.state <> 'deleted' ORDER BY w.last_active_at DESC`,
+  const rows = await q.query<WorkspaceRow>(
+    `${WS_SELECT} WHERE w.application_id = $1 AND w.state <> 'deleted'
+       AND (w.owner_id = $2 OR EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.user_id = $2))
+     ORDER BY w.last_active_at DESC`,
     [applicationId, user.id],
   );
+  const allowed = new Map<string, boolean>();
+  const out: WorkspaceRow[] = [];
+  for (const r of rows) {
+    if (r.access === 'owner') {
+      out.push(r);
+      continue;
+    }
+    if (!allowed.has(r.environmentId)) {
+      allowed.set(r.environmentId, (await authorize(q, principalOf(user), 'environment.use', { type: 'environment', id: r.environmentId })).allowed);
+    }
+    if (allowed.get(r.environmentId)) out.push(r);
+  }
+  return out;
 }
 
 /**
- * Loads a workspace the caller may work in: they own it and still hold `environment.use`
- * on its environment (so revoking access takes effect immediately).
+ * Loads a workspace the caller may use: they own it or it was shared with them, and they
+ * still hold `environment.use` on its environment (so revoking access takes effect
+ * immediately). `access` is what the request needs and defaults to 'write', so callers
+ * that predate sharing keep refusing viewers.
  */
-export async function loadWorkspace(q: Queryable, user: AuthUser, id: string, opts: { allowNotReady?: boolean } = {}): Promise<WorkspaceRow> {
-  const [ws] = await q.query<WorkspaceRow>(`${WS_SELECT} WHERE w.id = $1 AND w.state <> 'deleted'`, [id]);
-  if (!ws || ws.ownerId !== user.id) throw HttpError.notFound('Workspace not found');
+export async function loadWorkspace(
+  q: Queryable,
+  user: AuthUser,
+  id: string,
+  opts: { allowNotReady?: boolean; access?: WorkspaceAccess } = {},
+): Promise<WorkspaceRow> {
+  const [ws] = await q.query<WorkspaceRow>(`${WS_SELECT} WHERE w.id = $1 AND w.state <> 'deleted'`, [id, user.id]);
+  if (!ws || !ws.access) throw HttpError.notFound('Workspace not found');
   await requirePermission(q, principalOf(user), 'environment.use', { type: 'environment', id: ws.environmentId });
+  const need = opts.access ?? 'write';
+  if (!SATISFIES[need].includes(ws.access)) {
+    throw HttpError.forbidden(
+      need === 'owner' ? 'Only the owner of this workspace can do this' : 'You have view-only access to this workspace',
+    );
+  }
   if (!opts.allowNotReady && ws.state !== 'ready') {
     throw HttpError.badRequest(ws.state === 'failed' ? `Workspace failed to set up: ${ws.error ?? 'unknown error'}` : 'Workspace is still being set up');
   }
@@ -93,8 +144,12 @@ export async function touchWorkspace(q: Queryable, id: string) {
   await q.query('UPDATE workspaces SET last_active_at = now() WHERE id = $1', [id]);
 }
 
-export async function githubToken(q: Queryable, vault: Vault, userId: string): Promise<string | undefined> {
-  return readCredential(q, vault, userId, 'github_token');
+/**
+ * The user's GitHub token for a repository owner (organization or user), falling back to
+ * their default token. Always the acting user's own token, also in shared workspaces.
+ */
+export async function githubToken(q: Queryable, vault: Vault, userId: string, owner?: string): Promise<string | undefined> {
+  return readGithubToken(q, vault, userId, owner);
 }
 
 /**
@@ -122,13 +177,17 @@ export async function provisionWorkspace(
     await mkdir(paths.home, { recursive: true });
     // The git directory lives beside the checkout so the container can mount it read-only:
     // Claude can read history and diffs but cannot change git configuration or hooks.
+    const remoteOpts = { token: opts.token, allowLocalRemote: !opts.remote.startsWith('https://') };
     await runGit(['clone', '--no-tags', '--origin', 'origin', '--separate-git-dir', paths.gitDir, opts.remote, paths.repo], {
       cwd: paths.root,
-      token: opts.token,
       timeoutMs: 10 * 60_000,
-      allowLocalRemote: !opts.remote.startsWith('https://'),
+      ...remoteOpts,
     });
-    if (opts.createBranch) {
+    // A new, empty repository has no branches yet: start the working branch without history.
+    const heads = await runGit(['ls-remote', '--heads', 'origin'], { cwd: paths.repo, timeoutMs: 60_000, ...remoteOpts });
+    if (!heads.trim()) {
+      await runGit(['checkout', '--orphan', assertBranch(opts.branch)], { cwd: paths.repo });
+    } else if (opts.createBranch) {
       await runGit(['checkout', '-B', assertBranch(opts.branch), `origin/${assertBranch(opts.baseBranch)}`], { cwd: paths.repo });
     } else {
       await runGit(['checkout', assertBranch(opts.branch)], { cwd: paths.repo });

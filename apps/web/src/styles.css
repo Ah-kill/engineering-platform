@@ -178,3 +178,66 @@ button.mfa-link:hover { background: none; text-decoration: underline; }
 @media (max-width: 420px) {
   .mfa-code-list { grid-template-columns: 1fr; }
 }
+
+/* audit log: filters, export, phone layout */
+.audit-head { flex-wrap: wrap; align-items: flex-start; }
+.audit-head .btn { white-space: nowrap; }
+a.btn { display: inline-block; color: var(--text); }
+a.btn:hover { background: var(--surface-2); text-decoration: none; }
+.audit-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 12px; align-items: end; }
+.audit-filter-actions { display: flex; gap: 8px; }
+.audit-when { white-space: nowrap; }
+.audit-where { min-width: 120px; }
+.audit-details { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-more { justify-self: start; }
+@media (max-width: 760px) {
+  .audit-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .audit-filters label:first-child { grid-column: 1 / -1; }
+  .audit-card { padding: 0; }
+  .audit-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .audit-table, .audit-table tbody, .audit-table tr, .audit-table td { display: block; width: 100%; }
+  .audit-table tr { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .audit-table tr:last-child { border-bottom: 0; }
+  .audit-table td { border: 0; padding: 2px 0; display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 8px; }
+  .audit-table td::before { content: attr(data-label); color: var(--muted); font: 600 11.5px/1.7 system-ui, sans-serif; text-transform: uppercase; letter-spacing: .03em; }
+  .audit-table .audit-empty td { display: block; }
+  .audit-table .audit-empty td::before { content: none; }
+  .audit-details { max-width: none; white-space: normal; word-break: break-word; }
+  .audit-when { white-space: normal; }
+}
+
+/* signed-in devices (Account page) */
+.device-list { list-style: none; margin: 0; padding: 0; display: grid; }
+.device { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
+.device:first-child { border-top: 0; padding-top: 0; }
+.device-info { min-width: 0; }
+.device-name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 500; }
+.device-meta { font-size: 12.5px; overflow-wrap: anywhere; }
+.device button { flex: none; }
+
+/* organisation settings and budgets */
+.org-note { font-size: 12.5px; margin: 4px 0 0; }
+.org-email { font-size: 12.5px; overflow-wrap: anywhere; }
+.org-budgets .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.org-override { display: flex; gap: 6px; align-items: center; min-width: 180px; }
+.org-override input { min-width: 0; }
+.budget-meter { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 4px; min-width: 60px; }
+.budget-meter > span { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.budget-meter.over > span { background: var(--danger); }
+.my-budget { display: grid; gap: 6px; padding: 12px 16px; }
+.my-budget-line { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.my-budget-note { font-size: 12.5px; }
+@media (max-width: 760px) {
+  .org-budgets thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .org-budgets, .org-budgets tbody, .org-budgets tr, .org-budgets td { display: block; width: 100%; }
+  .org-budgets tr { padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .org-budgets tr:last-child { border-bottom: 0; }
+  .org-budgets td { border: 0; padding: 3px 0; }
+  .org-budgets td.num { text-align: left; }
+  .org-budgets td.num::before { content: attr(data-label) ': '; color: var(--muted); font-size: 12.5px; }
+  .org-override { min-width: 0; }
+}
+@media (forced-colors: active) {
+  .budget-meter { border: 1px solid CanvasText; }
+  .budget-meter > span { background: Highlight; }
+}

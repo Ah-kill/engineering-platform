@@ -1,12 +1,13 @@
 import { useState, type FormEvent } from 'react';
-import { api, type AgentSettings, type CredentialKind, type ModelOption } from '../api';
+import { api, type AgentSettings, type CredentialKind, type ModelOption, type SettingsWithGithub } from '../api';
+import { GithubTokens } from '../components/GithubTokens';
 import { useAction, useResource } from '../hooks';
 
 interface ModelsResponse { models: ModelOption[]; fetchedAt: string; errors: string[] }
 interface Versions { sdk: string; claudeCode: string; latestSdk: string | null; updateAvailable: boolean }
 
 export function SettingsPage() {
-  const settings = useResource<AgentSettings>('/me/settings');
+  const settings = useResource<SettingsWithGithub>('/me/settings');
   const versions = useResource<Versions>('/system/claude-code');
 
   if (settings.error) return <p className="error">{settings.error.message}</p>;
@@ -73,21 +74,15 @@ export function SettingsPage() {
       <section className="card stack">
         <div>
           <h2 style={{ marginBottom: 4 }}>GitHub</h2>
-          <p className="muted" style={{ margin: 0 }}>Used to clone, push and open pull requests as you.</p>
+          <p className="muted" style={{ margin: 0 }}>Used to clone, push, list repositories and open or merge pull requests as you.</p>
         </div>
-        <CredentialField
-          kind="github_token"
-          label="GitHub personal access token"
-          placeholder="github_pat_…"
-          state={s.credentials.github_token}
-          onChange={settings.reload}
-          help={
-            <>
-              Create a <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">fine-grained token</a> limited to the client repositories you work on,
-              with <b>Contents: read and write</b> and <b>Pull requests: read and write</b>. Set an expiry date.
-            </>
-          }
-        />
+        <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+          Create a <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">fine-grained token</a> for each client organization you work in
+          (fine-grained tokens belong to one owner), with <b>Contents: read and write</b> and <b>Pull requests: read and write</b>, and an expiry date.
+          To create repositories from the platform, the token also needs <b>Administration: read and write</b>.
+          The platform picks the token for the repository's owner and falls back to your default token.
+        </p>
+        <GithubTokens tokens={s.githubTokens ?? []} onChange={settings.reload} />
       </section>
 
       {versions.data && (

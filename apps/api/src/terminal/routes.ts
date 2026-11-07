@@ -9,12 +9,13 @@ import { caller, type RouteDeps } from '../http/app.js';
 import { HttpError } from '../http/errors.js';
 import type { AuthUser } from '../identity/sessions.js';
 import { resolveVariables } from '../variables/variables.js';
-import { issueAwsEnvForRun } from '../aws/aws.js';
+import { awsSecretValues, issueAwsEnvForRun } from '../aws/aws.js';
 import { registerTerminalCounter } from '../workspaces/terminal-registry.js';
 import { getStsClient } from '../aws/sts.js';
 import { workspacePaths } from '../workspaces/paths.js';
 import { loadWorkspace, type WorkspaceRow, networkPolicyFor } from '../workspaces/service.js';
 import { ContainerShell } from './shell.js';
+import { StreamRedactor } from './redact.js';
 
 /**
  * Browser terminal: a WebSocket to an interactive shell inside the workspace's container.
@@ -28,6 +29,8 @@ import { ContainerShell } from './shell.js';
  * The shell only ever runs in the container (uid 1000, no capabilities, the workspace's
  * network policy), never on the host. It gets the environment's variables but not the
  * developer's Claude or GitHub credentials. Terminal contents are never logged or audited.
+ * Output passes through a redactor that replaces the environment's secret values (and the
+ * AWS session's) before it reaches the browser; only variable names are audited.
  */
 
 export const MAX_TERMINALS_PER_WORKSPACE = 3;
@@ -38,6 +41,8 @@ const PING_INTERVAL_MS = 30_000;
 /** Output waiting to reach a slow browser before we stop reading from the shell. */
 const MAX_BUFFERED_BYTES = 1024 * 1024;
 const MAX_QUEUED_MESSAGES = 200;
+/** How long output that might be the start of a secret is held back before it is sent anyway. */
+export const REDACT_FLUSH_MS = 40;
 
 const idParam = z.object({ id: z.string().uuid() });
 const sizeQuery = z.object({
@@ -55,6 +60,8 @@ interface Prepared {
   user: AuthUser;
   ws: WorkspaceRow;
   env: Record<string, string>;
+  /** Secret values to redact from the output: the environment's secrets and AWS session credentials. */
+  secrets: string[];
   cols: number;
   rows: number;
 }
@@ -126,14 +133,17 @@ export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
               'The terminal needs workspace containers (WORKSPACE_RUNTIME=docker). This server runs workspaces on the host, and the platform never opens a shell on the host.',
             );
           }
-          const vars = req.ws ? await resolveVariables(q, vault, ws.environmentId) : { env: {} };
-          return { user, ws, env: vars.env, ...size };
+          const vars = req.ws ? await resolveVariables(q, vault, ws.environmentId) : { env: {}, secretValues: [] };
+          return { user, ws, env: vars.env, secrets: vars.secretValues, ...size };
         });
         if (req.ws) {
           const aws = await issueAwsEnvForRun(db, user.orgId, vault, getStsClient(), {
             environmentId: p.ws.environmentId, userId: user.id, workspaceId: id, isOrgAdmin: user.isOrgAdmin,
           }).catch(() => null); // failure is audited by the broker; the terminal still opens
-          if (aws) p.env = { ...p.env, ...aws };
+          if (aws) {
+            p.env = { ...p.env, ...aws };
+            p.secrets = [...p.secrets, ...awsSecretValues(aws)];
+          }
         }
         if (req.ws && countFor(id) >= MAX_TERMINALS_PER_WORKSPACE) {
           throw new HttpError(409, 'too_many_terminals', `At most ${MAX_TERMINALS_PER_WORKSPACE} terminals can be open in a workspace. Close one and try again.`);
@@ -249,25 +259,48 @@ export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
       const sh = new ContainerShell({ workspaceId: wsId, env: p.env, cols: p.cols, rows: p.rows });
       shell = sh;
       openedAt = Date.now();
-      void record(p, 'terminal.opened', { cols: p.cols, rows: p.rows, variables: Object.keys(p.env).length });
+      // Variable names only, never values.
+      void record(p, 'terminal.opened', { cols: p.cols, rows: p.rows, variables: Object.keys(p.env).sort() });
 
-      const relay = (chunk: Buffer) => {
-        lastActivity = Date.now();
-        send(chunk);
-        // Backpressure: stop reading from the shell while the browser falls behind.
-        if (socket.bufferedAmount > MAX_BUFFERED_BYTES && !sh.stdout.isPaused()) {
-          sh.stdout.pause();
-          const wait = setInterval(() => {
-            if (ended || socket.bufferedAmount < MAX_BUFFERED_BYTES / 4) {
-              clearInterval(wait);
-              sh.stdout.resume();
-            }
-          }, 50);
-        }
+      // One redactor per stream: output is buffered across chunk boundaries so a secret split
+      // between two reads is still caught; held bytes go out after a short pause.
+      const flushers: (() => void)[] = [];
+      const relayFor =(stream: NodeJS.ReadableStream & { isPaused(): boolean; pause(): void; resume(): void }) => {
+        const redactor = new StreamRedactor(p.secrets);
+        let flushTimer: NodeJS.Timeout | undefined;
+        const flush = () => {
+          flushTimer = undefined;
+          const rest = redactor.flush();
+          if (rest.length) send(rest);
+        };
+        flushers.push(() => {
+          if (flushTimer) clearTimeout(flushTimer);
+          flush();
+        });
+        return (chunk: Buffer) => {
+          lastActivity = Date.now();
+          const out = redactor.push(chunk);
+          if (out.length) send(out);
+          if (redactor.pending && !flushTimer) {
+            flushTimer = setTimeout(flush, REDACT_FLUSH_MS);
+            flushTimer.unref();
+          }
+          // Backpressure: stop reading from the shell while the browser falls behind.
+          if (socket.bufferedAmount > MAX_BUFFERED_BYTES && !stream.isPaused()) {
+            stream.pause();
+            const wait = setInterval(() => {
+              if (ended || socket.bufferedAmount < MAX_BUFFERED_BYTES / 4) {
+                clearInterval(wait);
+                stream.resume();
+              }
+            }, 50);
+          }
+        };
       };
-      sh.stdout.on('data', relay);
-      sh.stderr.on('data', relay);
+      sh.stdout.on('data', relayFor(sh.stdout));
+      sh.stderr.on('data', relayFor(sh.stderr));
       sh.onExit((code) => {
+        for (const f of flushers) f();
         if (ended) return;
         send(notice(code === 0 ? 'Shell exited' : code === null ? 'Shell could not be started' : `Shell exited with code ${code}`));
         end('exited', 1000, 'Shell exited');

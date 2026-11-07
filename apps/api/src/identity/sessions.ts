@@ -51,6 +51,14 @@ export async function lookupSession(db: Database, token: string): Promise<AuthCo
   );
   const r = rows[0];
   if (!r) return undefined;
+  // Record use for "Signed-in devices", at most every 5 minutes per session.
+  await db.system((q) =>
+    q.query(
+      `UPDATE sessions SET last_used_at = now()
+        WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '5 minutes')`,
+      [r.session_id],
+    ),
+  );
   return {
     sessionId: r.session_id,
     user: { id: r.id, orgId: r.org_id, email: r.email, displayName: r.display_name, isOrgAdmin: r.is_org_admin },

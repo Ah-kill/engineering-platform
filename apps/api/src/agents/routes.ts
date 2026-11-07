@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { caller, type RouteDeps } from '../http/app.js';
-import { authorize } from '../access/authorize.js';
+import { authorize, requirePermission } from '../access/authorize.js';
 import { audit } from '../audit/audit.js';
 import { principalOf } from '../identity/user-routes.js';
 import { HttpError } from '../http/errors.js';
@@ -14,9 +14,13 @@ import { claudeCodeVersions } from './version.js';
 import { resolveVariables } from '../variables/variables.js';
 import { awsSecretValues, issueAwsEnvForRun } from '../aws/aws.js';
 import { getStsClient } from '../aws/sts.js';
+import { requireWithinBudget } from '../org/budgets.js';
+import { registerRunCheck } from './housekeeping.js';
 import path from 'node:path';
 
 const idParam = z.object({ id: z.string().uuid() });
+/** Largest transcript returned at once; conversations are far smaller in practice. */
+const MAX_TRANSCRIPT_EVENTS = 5_000;
 
 const runBody = z.object({
   prompt: z.string().trim().min(1).max(50_000),
@@ -28,7 +32,13 @@ const runBody = z.object({
 const eventsQuery = z.object({ after: z.coerce.number().int().nonnegative().default(0) });
 
 export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
-  const { db, vault, agents, workspacesDir } = deps;
+  const { db, vault, agents, workspacesDir, config } = deps;
+  // Run limits from configuration, and let the idle reaper (main.ts) see which workspaces are busy.
+  agents.configure({ maxMinutes: config.AGENT_MAX_MINUTES, maxWorkspaceGb: config.WORKSPACE_MAX_GB });
+  const unregister = registerRunCheck((id) => agents.isRunning(id));
+  app.addHook('onClose', async () => {
+    unregister();
+  });
 
   /** Models available to the caller's account, discovered live (see agents/models.ts). */
   app.get('/models', async (req) => {
@@ -66,7 +76,8 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
            LEFT JOIN LATERAL (
              SELECT id, title, updated_at FROM agent_sessions WHERE workspace_id = w.id ORDER BY updated_at DESC LIMIT 1
            ) s ON true
-          WHERE w.owner_id = $1 AND w.state <> 'deleted' AND a.archived_at IS NULL AND c.archived_at IS NULL
+          WHERE (w.owner_id = $1 OR EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id AND m.user_id = $1))
+            AND w.state <> 'deleted' AND a.archived_at IS NULL AND c.archived_at IS NULL
           ORDER BY greatest(w.last_active_at, coalesce(s.updated_at, w.last_active_at)) DESC
           LIMIT 12`,
         [user.id],
@@ -104,7 +115,9 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
     const { user } = caller(req);
     const { id } = idParam.parse(req.params);
     return db.tenant(user.orgId, async (q) => {
-      await loadWorkspace(q, user, id);
+      // Members with read access may open the workspace; the list still shows only the
+      // caller's own conversations (admins see everyone's under team activity).
+      await loadWorkspace(q, user, id, { access: 'read' });
       const sessions = await q.query(
         `SELECT id, title, model, auth_mode AS "authMode", cost_usd::float AS "costUsd",
                 input_tokens::int AS "inputTokens", output_tokens::int AS "outputTokens",
@@ -122,10 +135,17 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
     const body = runBody.parse(req.body);
     const ctx = await db.tenant(user.orgId, async (q) => {
       const ws = await loadWorkspace(q, user, id);
+      // The developer's monthly Claude budget (org default or personal override); 403 when spent.
+      await requireWithinBudget(q, user.orgId, user.id);
       const settings = await readAgentSettings(q, user.id);
       const auth = await claudeAuthEnv(q, vault, user.id);
       const vars = await resolveVariables(q, vault, ws.environmentId);
-      return { ws, model: body.model ?? settings.defaultModel, auth, vars };
+      const [extra] = await q.query<{ protected: boolean; instructions: string }>(
+        `SELECT e.protected, a.agent_instructions AS instructions
+           FROM environments e JOIN applications a ON a.id = e.application_id WHERE e.id = $1`,
+        [ws.environmentId],
+      );
+      return { ws, model: body.model ?? settings.defaultModel, auth, vars, protected: extra?.protected ?? true, instructions: extra?.instructions ?? '' };
     });
     const paths = workspacePaths(workspacesDir, id);
     // Short-lived AWS credentials when the environment has a role configured. A failure is
@@ -149,7 +169,10 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
         clientId: ctx.ws.clientId,
         applicationId: ctx.ws.applicationId,
         environmentId: ctx.ws.environmentId,
+        environmentKind: ctx.ws.environmentKind,
+        protected: ctx.protected,
         labels: { client: ctx.ws.clientName, application: ctx.ws.applicationName, environment: ctx.ws.environmentName, branch: ctx.ws.branch },
+        instructions: ctx.instructions,
         authEnv: ctx.auth.env,
         authMode: ctx.auth.mode,
         // Broker values win over any same-named variable.
@@ -159,6 +182,84 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
       },
       { prompt: body.prompt, mode: body.mode, model: ctx.model, sessionId: body.sessionId },
     );
+  });
+
+  /**
+   * Team activity: every conversation in the application's workspaces, for app admins
+   * (`application.update`) and org admins. Metadata only; transcripts are fetched one by one.
+   */
+  app.get('/applications/:id/agent/sessions', async (req) => {
+    const { user } = caller(req);
+    const { id } = idParam.parse(req.params);
+    return db.tenant(user.orgId, async (q) => {
+      await requirePermission(q, principalOf(user), 'application.update', { type: 'application', id });
+      const rows = await q.query<{ workspaceId: string } & Record<string, unknown>>(
+        `SELECT s.id, s.title, s.model, s.auth_mode AS "authMode", s.cost_usd::float AS "costUsd",
+                s.input_tokens::int AS "inputTokens", s.output_tokens::int AS "outputTokens",
+                s.created_at AS "createdAt", s.updated_at AS "updatedAt",
+                s.user_id AS "userId", u.display_name AS "userName", u.email AS "userEmail",
+                w.id AS "workspaceId", w.branch, w.state AS "workspaceState",
+                e.name AS "environmentName", e.kind AS "environmentKind"
+           FROM agent_sessions s
+           JOIN workspaces w ON w.id = s.workspace_id
+           JOIN environments e ON e.id = w.environment_id
+           JOIN users u ON u.id = s.user_id
+          WHERE w.application_id = $1
+          ORDER BY s.updated_at DESC
+          LIMIT 200`,
+        [id],
+      );
+      return { sessions: rows.map((r) => ({ ...r, running: agents.activeSession(r.workspaceId) === r.id })) };
+    });
+  });
+
+  /**
+   * A conversation's stored events, read-only. For its owner (while they may still work in the
+   * environment) and for the application's admins and org admins. Secrets were redacted when the
+   * events were written. Views by someone other than the owner are audited.
+   */
+  app.get('/agent/sessions/:id/transcript', async (req) => {
+    const { user } = caller(req);
+    const { id } = idParam.parse(req.params);
+    return db.tenant(user.orgId, async (q) => {
+      const [s] = await q.query<{
+        id: string; title: string; model: string; userId: string; userName: string; workspaceId: string; branch: string;
+        applicationId: string; clientId: string; environmentId: string; environmentName: string;
+        costUsd: number; inputTokens: number; outputTokens: number; createdAt: string; updatedAt: string;
+      }>(
+        `SELECT s.id, s.title, s.model, s.user_id AS "userId", u.display_name AS "userName",
+                w.id AS "workspaceId", w.branch, w.application_id AS "applicationId", a.client_id AS "clientId",
+                w.environment_id AS "environmentId", e.name AS "environmentName",
+                s.cost_usd::float AS "costUsd", s.input_tokens::int AS "inputTokens", s.output_tokens::int AS "outputTokens",
+                s.created_at AS "createdAt", s.updated_at AS "updatedAt"
+           FROM agent_sessions s
+           JOIN workspaces w ON w.id = s.workspace_id
+           JOIN applications a ON a.id = w.application_id
+           JOIN environments e ON e.id = w.environment_id
+           JOIN users u ON u.id = s.user_id
+          WHERE s.id = $1`,
+        [id],
+      );
+      if (!s) throw HttpError.notFound('Conversation not found');
+      const principal = principalOf(user);
+      const isAdmin = (await authorize(q, principal, 'application.update', { type: 'application', id: s.applicationId })).allowed;
+      const isOwner =
+        s.userId === user.id && (await authorize(q, principal, 'environment.use', { type: 'environment', id: s.environmentId })).allowed;
+      if (!isAdmin && !isOwner) throw HttpError.notFound('Conversation not found');
+      const events = await q.query<{ id: string; kind: string; data: unknown; createdAt: string }>(
+        `SELECT id::text AS id, kind, data, created_at AS "createdAt" FROM agent_events
+          WHERE session_id = $1 ORDER BY id LIMIT ${MAX_TRANSCRIPT_EVENTS}`,
+        [id],
+      );
+      if (s.userId !== user.id) {
+        await audit(q, {
+          orgId: user.orgId, actorId: user.id, action: 'agent.transcript.viewed', resourceType: 'agent_session', resourceId: id,
+          clientId: s.clientId, applicationId: s.applicationId, environmentId: s.environmentId, details: { ownerId: s.userId },
+        });
+      }
+      const { clientId: _c, ...session } = s;
+      return { session, events, truncated: events.length >= MAX_TRANSCRIPT_EVENTS };
+    });
   });
 
   app.post('/workspaces/:id/agent/cancel', async (req) => {
@@ -188,7 +289,7 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
     const history = await db.tenant(user.orgId, async (q) => {
       const [s] = await q.query<{ workspace_id: string; user_id: string }>('SELECT workspace_id, user_id FROM agent_sessions WHERE id = $1', [id]);
       if (!s || s.user_id !== user.id) throw HttpError.notFound();
-      await loadWorkspace(q, user, s.workspace_id);
+      await loadWorkspace(q, user, s.workspace_id, { access: 'read' });
       return q.query<{ id: string; kind: string; data: unknown; created_at: Date }>(
         'SELECT e.id::text AS id, e.kind, e.data, e.created_at FROM agent_events e WHERE e.session_id = $1 AND e.id > $2 ORDER BY e.id',
         [id, after],

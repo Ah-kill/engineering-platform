@@ -32,6 +32,12 @@ const schema = z.object({
   WORKSPACE_PIDS: z.coerce.number().int().positive().default(512),
   AGENT_MAX_TURNS: z.coerce.number().int().positive().default(80),
   AGENT_MAX_BUDGET_USD: z.coerce.number().positive().default(10),
+  /** Wall-clock limit per Claude run; the run is stopped when it is exceeded. */
+  AGENT_MAX_MINUTES: z.coerce.number().positive().default(30),
+  /** Stop a workspace's container after this many minutes without activity (0 = never). Files are kept. */
+  WORKSPACE_IDLE_MINUTES: z.coerce.number().min(0).default(120),
+  /** Refuse to start Claude when the workspace folder is larger than this (0 = no limit). */
+  WORKSPACE_MAX_GB: z.coerce.number().min(0).default(10),
   /** Production: serve the built web app (apps/web/dist) from this server, with SPA fallback. */
   SERVE_WEB: z
     .enum(['true', 'false'])

@@ -31,6 +31,8 @@ export type Permission =
   | 'application.view'
   | 'application.update'
   | 'application.archive'
+  /** Merge pull requests on GitHub from the platform. */
+  | 'application.merge'
   | 'environment.view'
   | 'environment.manage'
   | 'environment.use'
@@ -46,6 +48,7 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     'environment.use',
     'application.update',
     'application.archive',
+    'application.merge',
     'environment.manage',
     'grant.manage',
   ],
@@ -64,6 +67,7 @@ export const ORG_ADMIN_PERMISSIONS: readonly Permission[] = [
   'application.view',
   'application.update',
   'application.archive',
+  'application.merge',
   'environment.view',
   'environment.manage',
   'grant.manage',
