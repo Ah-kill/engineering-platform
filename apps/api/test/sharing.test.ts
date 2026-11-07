@@ -2,7 +2,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { AgentDriver } from '../src/agents/driver.js';
+import type { AgentDriver, AgentEvent, AgentRunInput } from '../src/agents/driver.js';
+import { registerTerminalUsers } from '../src/workspaces/terminal-registry.js';
 import { runGit } from '../src/git/git.js';
 import { Client, PASSWORD, seedOrg, setup, type TestEnv } from './helpers.js';
 
@@ -11,7 +12,9 @@ import { Client, PASSWORD, seedOrg, setup, type TestEnv } from './helpers.js';
  * workspace's environment. Viewers read; editors work; only the owner deletes and shares.
  */
 
-const driver: AgentDriver = { run: async function* () {} };
+type Script = (input: AgentRunInput) => AsyncGenerator<AgentEvent>;
+let script: Script = async function* () {};
+const driver: AgentDriver = { run: (input) => script(input) };
 
 let env: TestEnv;
 let tmp: string;
@@ -191,6 +194,42 @@ describe('editors', () => {
   it('cannot delete the workspace or manage members', async () => {
     expect((await editor.delete(`/api/workspaces/${wsId}`)).statusCode).toBe(403);
     expect((await editor.request('PUT', `/api/workspaces/${wsId}/members/${ids.outsider}`, { role: 'editor' })).statusCode).toBe(403);
+  });
+});
+
+describe('Claude runs in a shared workspace', () => {
+  const KEY = (c: string) => `sk-ant-api03-${c.repeat(40)}`;
+  const events = (sessionId: string) =>
+    env.db.system((q) => q.query<{ kind: string; data: Record<string, any> }>('SELECT kind, data FROM agent_events WHERE session_id = $1 ORDER BY id', [sessionId]));
+
+  it('only the person who started a run can approve its actions; the owner can stop it', async () => {
+    await editor.request('PUT', '/api/me/credentials/anthropic_api_key', { value: KEY('e') });
+    script = async function* (input) {
+      await input.canUseTool('Bash', { command: 'rm -rf build' }, { signal: input.abortController.signal } as never);
+    };
+    const run = await editor.post(`/api/workspaces/${wsId}/agent/run`, { prompt: 'clean', mode: 'execute' });
+    expect(run.statusCode, run.body).toBe(200);
+    const request = await waitFor(async () => (await events(run.json().sessionId)).find((e) => e.kind === 'approval_request'));
+    // The owner cannot answer the editor's approval...
+    expect((await owner.post(`/api/workspaces/${wsId}/agent/approvals/${request.data.approvalId}`, { allow: true })).statusCode).toBe(404);
+    // ...and cannot open a terminal into the container while the editor's run is active.
+    const term = await owner.get(`/api/workspaces/${wsId}/terminal`);
+    expect([409, 400]).toContain(term.statusCode); // 409 in Docker mode; tests use the local runtime (400)
+    // ...but can stop it.
+    expect((await owner.post(`/api/workspaces/${wsId}/agent/cancel`)).json()).toEqual({ cancelled: true });
+    await waitFor(async () => ((await editor.get(`/api/workspaces/${wsId}/agent/sessions`)).json().running ? undefined : true));
+  });
+
+  it('Claude does not run while someone else has a terminal open in the workspace', async () => {
+    script = async function* () {};
+    registerTerminalUsers((id) => (id === wsId ? [ids.owner!] : []));
+    try {
+      const r = await editor.post(`/api/workspaces/${wsId}/agent/run`, { prompt: 'x', mode: 'plan' });
+      expect(r.statusCode).toBe(409);
+      expect(r.json().error.message).toMatch(/terminal open/);
+    } finally {
+      registerTerminalUsers(() => []);
+    }
   });
 });
 

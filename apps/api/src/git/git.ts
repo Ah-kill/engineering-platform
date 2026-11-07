@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { HttpError } from '../http/errors.js';
 
@@ -26,9 +28,28 @@ export class GitError extends Error {
 /** Only these variables from the server's environment reach git. */
 const PASS_ENV = ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'LANG'];
 
+/**
+ * For a platform workspace (<root>/repo checkout + <root>/git directory), the git directory to
+ * use, bypassing the checkout's own `.git` file. Code inside the container can rewrite that
+ * file (the checkout is writable) to point at a git directory it controls, whose config could
+ * define filters that would then run on the host during commit or discard. The real git
+ * directory is mounted read-only in the container, so git is always pointed at it explicitly.
+ */
+function workspaceGitDir(cwd: string): { gitDir: string; workTree: string } | undefined {
+  const workTree = path.resolve(cwd);
+  if (path.basename(workTree) !== 'repo') return undefined;
+  const gitDir = path.join(path.dirname(workTree), 'git');
+  return existsSync(path.join(gitDir, 'HEAD')) ? { gitDir, workTree } : undefined;
+}
+
 export function runGit(args: string[], opts: GitOptions): Promise<string> {
   const env: Record<string, string> = {};
   for (const k of PASS_ENV) if (process.env[k]) env[k] = process.env[k]!;
+  const ws = workspaceGitDir(opts.cwd);
+  if (ws) {
+    env.GIT_DIR = ws.gitDir;
+    env.GIT_WORK_TREE = ws.workTree;
+  }
   Object.assign(env, {
     GIT_TERMINAL_PROMPT: '0',
     GIT_ASKPASS: '',

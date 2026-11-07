@@ -237,7 +237,7 @@ describe('AWS CLI', () => {
     'aws ec2 describe-instances',
     'aws --region eu-west-1 ec2 describe-security-groups --output json',
     'aws s3api list-buckets',
-    'aws lambda get-function-configuration --function-name x',
+    'aws lambda list-functions --max-items 5',
     'aws logs tail /aws/lambda/payments --follow',
     'aws logs filter-log-events --log-group-name g --filter-pattern ERROR',
     'aws logs get-log-events --log-group-name g --log-stream-name s',
@@ -321,14 +321,6 @@ describe('protected environments', () => {
       'cat package.json | jq .scripts',
       'ls 2>&1 | head',
       'pwd && ls',
-      'npm test',
-      'npm run test',
-      'pnpm test',
-      'npx vitest run',
-      'npx jest src/retry.test.ts',
-      'pytest -q',
-      'go test ./...',
-      'cargo test',
     ], 'allow', PROD);
   });
 
@@ -400,5 +392,36 @@ describe('existing rules still apply', () => {
     expect(decideTool(repo, 'Bash', { command: 'node x.js' })).toEqual({ action: 'allow' });
     expect(decideTool(repo, 'Bash', { command: 'aws ec2 describe-instances' })).toEqual({ action: 'allow' });
     expect(decideTool(repo, 'Bash', { command: 'psql' }).action).toBe('ask');
+  });
+});
+
+describe('review fixes: allowlist escapes, env dumps, AWS data reads', () => {
+  it('protected environments refuse options that make read-only programs run or write things', () => {
+    expectAll(['sort --compress-program=sh file', 'sort -T /tmp a', 'sort -o out a', 'tree -o out.txt', 'file -C -m x', 'date -s "2020-01-01"', 'uniq in.txt out.txt'], 'ask', PROD);
+    expectAll(['sort -r a.txt', 'tree -L 2', 'file package.json', 'date', 'uniq -c a.txt'], 'allow', PROD);
+  });
+
+  it('protected environments ask before running tests (they execute repository code)', () => {
+    expectAll(['npm test', 'pnpm test', 'yarn test', 'npx vitest run', 'pytest', 'go test ./...', 'cargo test'], 'ask', PROD);
+    expect(action('npm test', DEV)).toBe('allow');
+  });
+
+  it('environment dumps are denied even when disguised by quoting', () => {
+    expectAll(["p'rint'env", 'pr""intenv', 'env', 'env -0', 'export', 'declare -x', 'set', 'cat /proc/self/environ', 'tr "\0" "\n" < /proc/1/environ'], 'deny');
+    expect(action('env NODE_ENV=test npm test')).toBe('allow');
+    expect(action('echo "set the value"')).toBe('allow');
+  });
+
+  it('AWS reads that return data, code or environment variables need approval', () => {
+    for (const c of [
+      'aws lambda get-function --function-name f',
+      'aws lambda get-function-configuration --function-name f',
+      'aws ecs describe-task-definition --task-definition t',
+      'aws s3api get-object --bucket b --key k out.json',
+      'aws dynamodb get-item --table-name t --key {}',
+      'aws cloudformation get-template --stack-name s',
+    ]) expect(action(c), c).toBe('ask');
+    expect(classifyAws(['aws', 'lambda', 'list-functions']).read).toBe(true);
+    expect(action('aws logs tail /aws/lambda/f')).toBe('allow');
   });
 });

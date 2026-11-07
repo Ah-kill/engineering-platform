@@ -25,7 +25,18 @@ const HARD_DENY: [RegExp, string][] = [
   [ENV_DUMP, 'Dumping environment variables is not allowed'],
   [/\$env:|Get-ChildItem\s+env:|\[Environment\]::GetEnvironmentVariable/i, 'Reading environment variables is not allowed'],
   [/(\.credentials\.json|vault\.key|[\\/]\.ssh[\\/]|[\\/]\.aws[\\/])/i, 'Reading credential files is not allowed'],
+  [/\/proc\/[^/\s]*\/environ\b/i, 'Reading process environments is not allowed'],
 ];
+
+/** Programs that print the environment when run as a command (after quotes are resolved by the parser). */
+const ENV_PRINTERS = new Set(['printenv', 'set', 'export', 'declare', 'typeset', 'compgen']);
+function dumpsEnvironment(argv: string[]): boolean {
+  const [prog = '', ...args] = argv;
+  if (ENV_PRINTERS.has(prog)) return prog === 'export' || prog === 'set' ? args.length === 0 || args.every((a) => a.startsWith('-')) : true;
+  // `env` with no program to run (only options and NAME=value) prints everything.
+  if (prog === 'env') return !args.some((a) => !a.startsWith('-') && !a.includes('='));
+  return false;
+}
 
 /** Allowed only after the developer approves in the chat. */
 const NEEDS_APPROVAL: [RegExp, string][] = [
@@ -58,7 +69,9 @@ function insideRepo(repoRoot: string, p: unknown): boolean {
   const root = P.resolve(repoRoot);
   const rel = P.relative(root, resolved);
   if (rel.startsWith('..') || P.isAbsolute(rel)) return false;
-  return rel.split(P.sep)[0]?.toLowerCase() !== '.git' || !/config|hooks/i.test(rel);
+  // Nothing under .git (including the .git file itself) is for Claude's file tools: git
+  // commands read history, and rewriting .git could redirect the platform's own git.
+  return rel.split(P.sep)[0]?.toLowerCase().replace(/[. ]+$/, '') !== '.git';
 }
 
 /** Where the run happens. Protected (production) environments get the stricter command rules. */
@@ -149,6 +162,19 @@ const AWS_VALUE_OPTS = new Set([
 /** Read calls that still hand out secrets or credentials (get-secret-value, get-session-token, ...). */
 const SENSITIVE_AWS_READ = /(secret|token|password|credential|login|session|federation|access-detail|access-key|decrypt|parameter|authorization|data-key|presign|private-key)/;
 
+/**
+ * Reads that return data or configuration rather than metadata: object and item contents,
+ * function code and environment variables, task definitions (environment variables), templates.
+ */
+const AWS_DATA_READS = new Set([
+  's3api get-object', 's3api get-object-torrent', 's3api get-object-attributes',
+  'dynamodb get-item', 'dynamodb batch-get-item',
+  'lambda get-function', 'lambda get-function-configuration', 'lambda get-layer-version',
+  'ecs describe-task-definition', 'kinesis get-records', 'ec2 get-console-output', 'ec2 get-console-screenshot',
+  'codecommit get-file', 'codecommit get-blob', 'cloudformation get-template', 'apigateway get-export',
+  'glue get-connection', 'glue get-connections', 'rds download-db-log-file-portion',
+]);
+
 type AwsClass = { read: true } | { read: false; reason: string; highRisk: boolean };
 
 export function classifyAws(argv: string[]): AwsClass {
@@ -167,6 +193,9 @@ export function classifyAws(argv: string[]): AwsClass {
   if (svc === 'ssm' && /^(put-parameter|delete-parameters?|label-parameter-version|unlabel-parameter-version)$/.test(op)) {
     return { read: false, reason: `Changes an AWS SSM parameter (aws ssm ${op})`, highRisk: true };
   }
+  if (AWS_DATA_READS.has(`${svc} ${op}`)) {
+    return { read: false, reason: `Reads data or configuration that may contain secrets (aws ${svc} ${op})`, highRisk: false };
+  }
   const read =
     (/^(describe|list|get)-/.test(op) && !SENSITIVE_AWS_READ.test(op) && !args.some((a) => a.startsWith('--with-decryption'))) ||
     (svc === 'logs' && ['tail', 'filter-log-events', 'get-log-events'].includes(op)) ||
@@ -183,7 +212,6 @@ const READ_ONLY = new Set([
 ]);
 const GIT_READ = new Set(['status', 'diff', 'log', 'show', 'blame', 'ls-files', 'ls-tree', 'rev-parse', 'describe', 'shortlog', 'cat-file']);
 const GIT_BRANCH_LIST = new Set(['-a', '-r', '-v', '-vv', '--list', '--all', '--remotes', '--show-current', '--verbose', '--merged', '--no-merged']);
-const SNAPSHOT_UPDATE = /^(-u|--update|--updateSnapshot|--update-snapshots?|--snapshot-update)$/;
 
 function readOnlyProgram(argv: string[]): boolean {
   const [prog = '', ...args] = argv;
@@ -196,26 +224,24 @@ function readOnlyProgram(argv: string[]): boolean {
     }
     case 'rg':
       return !args.some((a) => /^--pre(-glob)?(=|$)/.test(a));
+    // Options that make an otherwise read-only program write files or run other programs.
     case 'sort':
+      return !args.some((a) => /^-[a-zA-Z]*[oT]/.test(a) || /^--(output|compress-program|temporary-directory|random-source)/.test(a));
+    case 'tree':
       return !args.some((a) => /^-[a-zA-Z]*o/.test(a) || a.startsWith('--output'));
+    case 'file':
+      return !args.some((a) => /^-[a-zA-Z]*[Cm]/.test(a) || /^--(compile|magic-file)/.test(a));
+    case 'date':
+      return !args.some((a) => /^-[a-zA-Z]*s/.test(a) || a.startsWith('--set'));
+    case 'uniq':
+      // uniq INPUT OUTPUT writes the second file.
+      return args.filter((a) => !a.startsWith('-')).length <= 1;
     case 'find':
       return !args.some((a) => /^-(exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)$/.test(a));
     case 'aws':
       return classifyAws(argv).read;
-    // Test runners. They run the repository's own test code, which the developer reviews like any other code.
-    case 'npm':
-    case 'pnpm':
-    case 'yarn':
-    case 'bun':
-      return (args[0] === 'test' || args[0] === 't' || (args[0] === 'run' && args[1] === 'test')) && !args.some((a) => SNAPSHOT_UPDATE.test(a));
-    case 'vitest':
-      return args[0] === 'run' && !args.some((a) => SNAPSHOT_UPDATE.test(a));
-    case 'jest':
-    case 'pytest':
-      return !args.some((a) => SNAPSHOT_UPDATE.test(a));
-    case 'go':
-    case 'cargo':
-      return args[0] === 'test';
+    // Test runners are deliberately not here: tests execute the repository's own code (and its
+    // package scripts), which can do anything, so in protected environments they need approval.
     default:
       return READ_ONLY.has(prog);
   }
@@ -254,7 +280,7 @@ export function decideCommand(command: string, ctx: PolicyContext = {}, dialect:
       analysis.commands.every((c) => !c.envPrefix && readOnlyProgram(c.argv));
     if (!readOnly) {
       const where = ctx.environmentKind === 'production' ? 'Production environment' : 'Protected environment';
-      return ask(`${where}: only read-only commands (ls, cat, grep, git status/diff/log, read-only AWS, tests) run without approval`);
+      return ask(`${where}: only read-only commands (ls, cat, grep, git status/diff/log, read-only AWS) run without approval; tests run the repository's code, so they ask too`);
     }
   }
   return { action: 'allow' };
@@ -284,6 +310,10 @@ export function decideTool(
     const flat = flatten(command);
     for (const [re, reason] of HARD_DENY) {
       if (re.test(command) || (re !== ENV_DUMP && re.test(flat))) return { action: 'deny', reason };
+    }
+    // The same rule on the parsed commands, which sees through quoting such as p'rint'env.
+    if (analyzeCommand(command, { dialect: toolName === 'PowerShell' ? 'powershell' : 'bash' }).commands.some((c) => dumpsEnvironment(c.argv))) {
+      return { action: 'deny', reason: 'Dumping environment variables is not allowed' };
     }
     return decideCommand(command, ctx, toolName === 'PowerShell' ? 'powershell' : 'bash');
   }

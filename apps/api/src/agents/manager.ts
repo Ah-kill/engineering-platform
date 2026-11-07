@@ -55,6 +55,8 @@ export interface AgentLimits {
 
 interface ActiveRun {
   sessionId: string;
+  /** Who started the run: only they may answer its approvals. */
+  userId: string;
   abortController: AbortController;
   approvals: Map<string, (allow: boolean) => void>;
 }
@@ -103,6 +105,11 @@ export class AgentManager {
     return this.runs.has(workspaceId);
   }
 
+  /** The user whose run is active in the workspace, if any. */
+  runUser(workspaceId: string): string | undefined {
+    return this.runs.get(workspaceId)?.userId;
+  }
+
   activeSession(workspaceId: string): string | undefined {
     return this.runs.get(workspaceId)?.sessionId || undefined;
   }
@@ -125,8 +132,10 @@ export class AgentManager {
     return true;
   }
 
-  decide(workspaceId: string, approvalId: string, allow: boolean): boolean {
-    const resolve = this.runs.get(workspaceId)?.approvals.get(approvalId);
+  decide(workspaceId: string, approvalId: string, allow: boolean, userId: string): boolean {
+    const run = this.runs.get(workspaceId);
+    if (!run || run.userId !== userId) return false;
+    const resolve = run.approvals.get(approvalId);
     if (!resolve) return false;
     resolve(allow);
     return true;
@@ -169,7 +178,7 @@ export class AgentManager {
     // reserve synchronously, before any further await, so neither can slip in between.
     if (this.runs.has(ctx.workspaceId)) throw HttpError.conflict('Claude is already working in this workspace. Stop it or wait.');
     if (isWorkspaceLocked(ctx.workspaceId)) throw HttpError.conflict('A git operation is in progress in this workspace; try again in a moment.');
-    const run: ActiveRun = { sessionId: '', abortController: new AbortController(), approvals: new Map() };
+    const run: ActiveRun = { sessionId: '', userId: ctx.userId, abortController: new AbortController(), approvals: new Map() };
     this.runs.set(ctx.workspaceId, run);
 
     let session: { id: string; resume?: string };

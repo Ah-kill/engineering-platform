@@ -15,6 +15,7 @@ import { resolveVariables } from '../variables/variables.js';
 import { awsSecretValues, issueAwsEnvForRun } from '../aws/aws.js';
 import { getStsClient } from '../aws/sts.js';
 import { requireWithinBudget } from '../org/budgets.js';
+import { terminalUsers } from '../workspaces/terminal-registry.js';
 import { registerRunCheck } from './housekeeping.js';
 import path from 'node:path';
 
@@ -135,6 +136,11 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
     const body = runBody.parse(req.body);
     const ctx = await db.tenant(user.orgId, async (q) => {
       const ws = await loadWorkspace(q, user, id);
+      // In a shared workspace, Claude (with this user's credential in its environment) never
+      // runs while someone else has a terminal in the same container.
+      if (terminalUsers(id).some((u) => u !== user.id)) {
+        throw HttpError.conflict('Another person has a terminal open in this workspace. Claude can run once it is closed.');
+      }
       // The developer's monthly Claude budget (org default or personal override); 403 when spent.
       await requireWithinBudget(q, user.orgId, user.id);
       const settings = await readAgentSettings(q, user.id);
@@ -265,7 +271,10 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
   app.post('/workspaces/:id/agent/cancel', async (req) => {
     const { user } = caller(req);
     const { id } = idParam.parse(req.params);
-    await db.tenant(user.orgId, (q) => loadWorkspace(q, user, id));
+    const ws = await db.tenant(user.orgId, (q) => loadWorkspace(q, user, id));
+    // In a shared workspace, a run can be stopped by whoever started it or by the workspace owner.
+    const runUser = agents.runUser(id);
+    if (runUser && runUser !== user.id && ws.ownerId !== user.id) throw HttpError.forbidden('Only the person who started this run, or the workspace owner, can stop it');
     return { cancelled: agents.cancel(id) };
   });
 
@@ -274,7 +283,7 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
     const { id, approvalId } = z.object({ id: z.string().uuid(), approvalId: z.string().uuid() }).parse(req.params);
     const { allow } = z.object({ allow: z.boolean() }).parse(req.body);
     await db.tenant(user.orgId, (q) => loadWorkspace(q, user, id));
-    if (!agents.decide(id, approvalId, allow)) throw HttpError.notFound('No pending approval with that id');
+    if (!agents.decide(id, approvalId, allow, user.id)) throw HttpError.notFound('No pending approval with that id');
     return { ok: true };
   });
 

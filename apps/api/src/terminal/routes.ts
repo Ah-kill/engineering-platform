@@ -10,7 +10,7 @@ import { HttpError } from '../http/errors.js';
 import type { AuthUser } from '../identity/sessions.js';
 import { resolveVariables } from '../variables/variables.js';
 import { awsSecretValues, issueAwsEnvForRun } from '../aws/aws.js';
-import { registerTerminalCounter } from '../workspaces/terminal-registry.js';
+import { registerTerminalCounter, registerTerminalUsers } from '../workspaces/terminal-registry.js';
 import { getStsClient } from '../aws/sts.js';
 import { workspacePaths } from '../workspaces/paths.js';
 import { loadWorkspace, type WorkspaceRow, networkPolicyFor } from '../workspaces/service.js';
@@ -70,12 +70,15 @@ interface Prepared {
 const notice = (text: string) => Buffer.from(`\r\n\x1b[2m[${text}]\x1b[0m\r\n`, 'utf8');
 
 export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
-  const { config, db, vault, runtime, workspacesDir } = deps;
+  const { config, db, vault, runtime, workspacesDir, agents } = deps;
   /** Open terminals per workspace; a terminal counts from the upgrade until its shell is gone. */
   const open = new Map<string, Set<EndFn>>();
   const prepared = new WeakMap<FastifyRequest, Prepared>();
   const countFor = (id: string) => open.get(id)?.size ?? 0;
   registerTerminalCounter(countFor);
+  /** Who has each open terminal, so Claude never runs with another person's terminal in the same container. */
+  const owners = new Map<EndFn, { wsId: string; userId: string }>();
+  registerTerminalUsers((id) => [...owners.values()].filter((o) => o.wsId === id).map((o) => o.userId));
 
   const record = (p: Prepared, action: string, details: Record<string, unknown>, outcome: 'success' | 'failure' = 'success') =>
     db
@@ -145,6 +148,12 @@ export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
             p.secrets = [...p.secrets, ...awsSecretValues(aws)];
           }
         }
+        // A terminal shares the container (and uid) with Claude: never open one while another
+        // person's run, with their credential in its environment, is active.
+        const runUser = agents.runUser(id);
+        if (runUser && runUser !== user.id) {
+          throw new HttpError(409, 'run_in_progress', 'Another person is running Claude in this workspace. The terminal can open once the run ends.');
+        }
         if (req.ws && countFor(id) >= MAX_TERMINALS_PER_WORKSPACE) {
           throw new HttpError(409, 'too_many_terminals', `At most ${MAX_TERMINALS_PER_WORKSPACE} terminals can be open in a workspace. Close one and try again.`);
         }
@@ -188,6 +197,7 @@ export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
       if (ended) return;
       ended = true;
       set.delete(end);
+      owners.delete(end);
       if (!set.size) open.delete(wsId);
       clearInterval(timers);
       shell?.close();
@@ -197,6 +207,7 @@ export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
       }
     };
     set.add(end);
+    owners.set(end, { wsId, userId: p.user.id });
 
     const handle = (m: ClientMessage) => {
       if (m.type === 'input') {
