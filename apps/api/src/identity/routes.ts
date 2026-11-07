@@ -20,6 +20,12 @@ const mfaLoginBody = z.object({
 
 const challengeExpired = () => new HttpError(401, 'mfa_expired', 'This sign-in has expired. Sign in again.');
 
+/** Wrong codes allowed in a row (across all sign-in attempts) before two-step sign-in pauses. */
+const MFA_MAX_FAILURES = 10;
+const MFA_LOCK_MINUTES = 15;
+const mfaLocked = (until: Date) =>
+  new HttpError(429, 'mfa_locked', `Too many wrong codes. Two-step sign-in is paused until ${until.toISOString().slice(11, 16)} UTC.`);
+
 const changePasswordBody = z.object({
   currentPassword: z.string().min(1).max(1024),
   newPassword: z.string().min(MIN_PASSWORD_LENGTH).max(1024),
@@ -61,8 +67,8 @@ export async function identityRoutes(app: FastifyInstance, deps: RouteDeps) {
     async (req, reply) => {
       const body = loginBody.parse(req.body);
       const rows = await db.system((q) =>
-        q.query<{ id: string; org_id: string; password_hash: string; status: string; mfa_enabled: boolean }>(
-          'SELECT id, org_id, password_hash, status, mfa_enabled FROM users WHERE lower(email) = lower($1)',
+        q.query<{ id: string; org_id: string; password_hash: string; status: string; mfa_enabled: boolean; mfa_locked_until: Date | null }>(
+          'SELECT id, org_id, password_hash, status, mfa_enabled, mfa_locked_until FROM users WHERE lower(email) = lower($1)',
           [body.email],
         ),
       );
@@ -80,6 +86,7 @@ export async function identityRoutes(app: FastifyInstance, deps: RouteDeps) {
 
       // With two-step login on, the password alone gives no session, only a short-lived challenge.
       if (user.mfa_enabled) {
+        if (user.mfa_locked_until && user.mfa_locked_until > new Date()) throw mfaLocked(user.mfa_locked_until);
         const challenge = await createChallenge(db, { id: user.id, orgId: user.org_id });
         return { mfaRequired: true, challenge };
       }
@@ -101,7 +108,21 @@ export async function identityRoutes(app: FastifyInstance, deps: RouteDeps) {
       const outcome = await db.tenant(challenge.orgId, async (q) => {
         const user = await loadMfaUser(q, challenge.userId);
         if (!user || user.status !== 'active' || !user.mfaEnabled) return 'gone' as const;
+        const [lock] = await q.query<{ mfa_locked_until: Date | null }>('SELECT mfa_locked_until FROM users WHERE id = $1', [user.id]);
+        if (lock?.mfa_locked_until && lock.mfa_locked_until > new Date()) return { locked: lock.mfa_locked_until };
         const method = await verifySecondFactor(q, vault, user, body.code);
+        // Count wrong codes per user across challenges; pause after too many in a row.
+        if (method) {
+          await q.query('UPDATE users SET mfa_failures = 0 WHERE id = $1', [user.id]);
+        } else {
+          await q.query(
+            `UPDATE users SET
+               mfa_failures = CASE WHEN mfa_failures + 1 >= $2 THEN 0 ELSE mfa_failures + 1 END,
+               mfa_locked_until = CASE WHEN mfa_failures + 1 >= $2 THEN now() + make_interval(mins => $3) ELSE mfa_locked_until END
+             WHERE id = $1`,
+            [user.id, MFA_MAX_FAILURES, MFA_LOCK_MINUTES],
+          );
+        }
         await audit(q, {
           orgId: challenge.orgId,
           actorId: user.id,
@@ -112,6 +133,10 @@ export async function identityRoutes(app: FastifyInstance, deps: RouteDeps) {
         return method;
       });
 
+      if (outcome && typeof outcome === 'object') {
+        await finishChallenge(db, challenge.id);
+        throw mfaLocked(outcome.locked);
+      }
       if (outcome === 'gone') {
         await finishChallenge(db, challenge.id);
         throw challengeExpired();

@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { isAllowed, isPrivateAddress, parseRules, resolveTarget } from '../../runtime/egress-proxy.mjs';
 import { parseDotEnv, validateName } from '../src/variables/variables.js';
 import { HOST_RULE } from '../src/workspaces/runtime.js';
+import { awsHostsFor } from '../src/aws/aws.js';
+import { networkPolicyFor } from '../src/workspaces/service.js';
 
 describe('variable names', () => {
   it('accepts conventional names and rejects reserved or malformed ones', () => {
@@ -74,5 +76,16 @@ describe('egress proxy decisions', () => {
     expect(await resolveTarget('x.example.org', 443, rules, lookup)).toEqual({ address: '93.184.216.34' });
     expect(await resolveTarget('not-listed.com', 443, rules, lookup)).toMatchObject({ error: expect.stringMatching(/not in/) });
     expect(await resolveTarget('1.2.3.4', 443, parseRules('1.2.3.4'), lookup)).toMatchObject({ error: expect.any(String) });
+  });
+});
+
+describe('workspace network policy', () => {
+  it('adds region-scoped AWS endpoints only when a role is configured, never wildcards', () => {
+    const base = { egressMode: 'restricted' as const, egressHosts: ['api.example.com'], awsRegion: 'eu-west-1', awsConfigured: false };
+    expect(networkPolicyFor(base).hosts).toEqual(['api.example.com']);
+    const withAws = networkPolicyFor({ ...base, awsConfigured: true }).hosts;
+    expect(withAws).toEqual(expect.arrayContaining(['api.example.com', 'sts.amazonaws.com', 'sts.eu-west-1.amazonaws.com', 'logs.eu-west-1.amazonaws.com']));
+    expect(withAws.some((h) => h.includes('*'))).toBe(false);
+    expect(awsHostsFor('eu-west-1').some((h) => /^s3\.|execute-api|lambda-url/.test(h))).toBe(false);
   });
 });

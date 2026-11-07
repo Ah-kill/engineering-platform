@@ -303,9 +303,20 @@ export async function issueAwsEnvForRun(
   return awsEnvFrom(creds, plan.params.region);
 }
 
-/** AWS endpoints a workspace needs in restricted network mode once credentials are issued. */
-export const AWS_HOSTS = ['sts.amazonaws.com', '*.amazonaws.com', '*.api.aws'];
+/**
+ * AWS endpoints opened in restricted network mode once credentials are issued: STS plus the
+ * regional endpoints of services a read-only investigation typically uses, and IAM. No
+ * wildcards: *.amazonaws.com would also allow S3 bucket hosts and Lambda/API Gateway URLs
+ * in anyone's account, an easy way to carry data out. Other services can be added to the
+ * application's allowed hosts explicitly. Residual risk: any allowed AWS API can still reach
+ * another account's resources that grant public access; see docs/03-deployment.md.
+ */
+export const AWS_SERVICES = [
+  'sts', 'logs', 'monitoring', 'lambda', 'apigateway', 'dynamodb', 'ecs', 'eks', 'ec2',
+  'cloudformation', 'ssm', 'rds', 'elasticloadbalancing', 'events', 'states', 'tagging',
+];
 
-export function withAwsHosts(hosts: string[], awsIssued: boolean): string[] {
-  return awsIssued ? [...new Set([...hosts, ...AWS_HOSTS])] : hosts;
+export function awsHostsFor(region: string): string[] {
+  return ['sts.amazonaws.com', 'iam.amazonaws.com', ...AWS_SERVICES.map((svc) => `${svc}.${region}.amazonaws.com`)];
 }
+

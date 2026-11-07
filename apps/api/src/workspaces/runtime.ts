@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SpawnedProcess, SpawnOptions } from '@anthropic-ai/claude-agent-sdk';
 import { HttpError } from '../http/errors.js';
+import { openTerminals } from './terminal-registry.js';
 
 /**
  * Where Claude Code runs for a workspace.
@@ -94,7 +95,8 @@ const CONTAINER_REPO = '/ws/repo';
  * `sleep infinity`, terminal bridges and their descendants, and itself.
  */
 const SWEEP_SCRIPT = `
-import os, signal
+import os, signal, sys
+allowed_bridges = int(sys.argv[1])
 me = os.getpid()
 procs = {}
 for pid in os.listdir('/proc'):
@@ -104,18 +106,27 @@ for pid in os.listdir('/proc'):
         with open('/proc/%s/stat' % pid) as f:
             ppid = int(f.read().rsplit(')', 1)[1].split()[1])
         with open('/proc/%s/cmdline' % pid, 'rb') as f:
-            cmd = f.read().replace(b'\\0', b' ').decode(errors='replace')
-        procs[int(pid)] = (ppid, cmd)
+            argv = [a.decode(errors='replace') for a in f.read().split(b'\\0') if a]
+        exe = os.readlink('/proc/%s/exe' % pid)
+        procs[int(pid)] = (ppid, argv, exe)
     except Exception:
         pass
-def keep(pid, seen=()):
-    if pid in (1, me) or pid in seen:
+bridges = [p for p, (pp, a, e) in procs.items()
+           if pp == 0 and a[1:2] == ['/opt/platform/pty-bridge.py'] and e.startswith('/usr/bin/python3')]
+# More terminal shells than the platform opened: something imitates one. Signal the caller
+# to restart the container instead (ends every process, keeps the files).
+if len(bridges) > allowed_bridges:
+    sys.exit(3)
+sleepers = sorted(p for p, (pp, a, e) in procs.items() if pp == 1 and a == ['sleep', 'infinity'] and e == '/usr/bin/sleep')
+roots = set(bridges) | set(sleepers[:1]) | {1, me}
+def keep(pid, depth=0):
+    if pid in roots:
         return True
-    ppid, cmd = procs.get(pid, (0, ''))
-    if 'pty-bridge.py' in cmd or (ppid == 1 and cmd.strip() == 'sleep infinity'):
-        return True
-    return ppid in procs and ppid != 1 and keep(ppid, seen + (pid,))
-for pid in procs:
+    if pid not in procs or depth > 64:
+        return False
+    ppid = procs[pid][0]
+    return ppid not in (0, 1) and keep(ppid, depth + 1)
+for pid in list(procs):
     if not keep(pid):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -288,10 +299,11 @@ export class DockerRuntime implements WorkspaceRuntime {
 
   async recycle(workspaceId: string): Promise<void> {
     // End everything the agent left behind (including background processes) but keep the
-    // container's init, its keep-alive process and the developer's terminal shells. If that
-    // cannot be done, restart the container, which ends every process and keeps the files.
+    // container's init, its keep-alive process and the developer's terminal shells. Shells are
+    // recognised as started by docker exec and counted against the terminals the platform has
+    // open; any surplus, or any failure, restarts the container (ends every process, keeps files).
     const name = DockerRuntime.containerName(workspaceId);
-    const swept = await run(['exec', name, 'python3', '-c', SWEEP_SCRIPT], { timeoutMs: 20_000 }).then(() => true, () => false);
+    const swept = await run(['exec', '-e', 'PATH=/usr/bin:/bin', name, '/usr/bin/python3', '-I', '-c', SWEEP_SCRIPT, String(openTerminals(workspaceId))], { timeoutMs: 20_000 }).then(() => true, () => false);
     if (!swept) await run(['restart', '-t', '2', name]).catch(() => undefined);
   }
 

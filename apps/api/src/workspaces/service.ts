@@ -10,6 +10,7 @@ import { readCredential } from '../settings/credentials.js';
 import type { Vault } from '../vault/vault.js';
 import { workspacePaths } from './paths.js';
 import { separateGitDir, type NetworkPolicy, type WorkspaceRuntime } from './runtime.js';
+import { awsHostsFor } from '../aws/aws.js';
 
 export interface WorkspaceRow {
   id: string;
@@ -34,6 +35,8 @@ export interface WorkspaceRow {
   environmentKind: string;
   egressMode: 'restricted' | 'open';
   egressHosts: string[];
+  awsRegion: string | null;
+  awsConfigured: boolean;
 }
 
 const WS_SELECT = `
@@ -43,7 +46,8 @@ const WS_SELECT = `
          r.owner AS "repoOwner", r.name AS "repoName", r.default_branch AS "defaultBranch",
          a.name AS "applicationName", a.client_id AS "clientId", c.name AS "clientName",
          e.name AS "environmentName", e.kind AS "environmentKind",
-         a.egress_mode AS "egressMode", a.egress_hosts AS "egressHosts"
+         a.egress_mode AS "egressMode", a.egress_hosts AS "egressHosts",
+         e.aws_region AS "awsRegion", (e.aws_role_arn IS NOT NULL) AS "awsConfigured"
     FROM workspaces w
     JOIN repositories r ON r.id = w.repository_id
     JOIN applications a ON a.id = w.application_id
@@ -73,6 +77,16 @@ export async function loadWorkspace(q: Queryable, user: AuthUser, id: string, op
     throw HttpError.badRequest(ws.state === 'failed' ? `Workspace failed to set up: ${ws.error ?? 'unknown error'}` : 'Workspace is still being set up');
   }
   return ws;
+}
+
+/**
+ * The one place a workspace's network policy is computed, so provisioning, Claude runs and
+ * terminals always agree (a different policy would rebuild the container). AWS endpoints for
+ * the environment's region are added whenever an AWS role is configured.
+ */
+export function networkPolicyFor(ws: Pick<WorkspaceRow, 'egressMode' | 'egressHosts' | 'awsRegion' | 'awsConfigured'>): NetworkPolicy {
+  const aws = ws.awsConfigured && ws.awsRegion ? awsHostsFor(ws.awsRegion) : [];
+  return { mode: ws.egressMode, hosts: [...new Set([...ws.egressHosts, ...aws])] };
 }
 
 export async function touchWorkspace(q: Queryable, id: string) {

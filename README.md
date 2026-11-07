@@ -6,7 +6,8 @@ branch, and work with Claude in a browser IDE: plan, execute, review the diff, c
 push and open a pull request. Works on desktop and on a phone.
 
 See [docs/01-architecture-and-research.md](docs/01-architecture-and-research.md) for the
-design and [docs/02-what-to-ask-clients.md](docs/02-what-to-ask-clients.md) for client onboarding.
+design, [docs/02-what-to-ask-clients.md](docs/02-what-to-ask-clients.md) for client onboarding and
+[docs/03-deployment.md](docs/03-deployment.md) for running it on a server and reaching it from your phone.
 
 ## Status
 
@@ -19,9 +20,13 @@ design and [docs/02-what-to-ask-clients.md](docs/02-what-to-ask-clients.md) for 
 | Phone layout | Built |
 | Home: continue where you left off; delete conversations and workspaces | Built |
 | Container isolation: Claude Code runs in a Docker container per workspace | Built |
-| Per-environment secrets and third-party API keys (Twilio, Okta, ...) | **Next** |
-| AWS account access broker | Planned |
-| Web terminal | Planned |
+| Environment variables and secrets per environment (any service), `.env` import | Built |
+| Network access per application: only allowed sites (default) or unrestricted | Built |
+| Browser terminal into the workspace container | Built |
+| Two-step login (authenticator app + recovery codes) | Built |
+| AWS access broker: per-environment role, short-lived credentials | Built |
+| Usage and cost dashboard | Built |
+| Production serving, deployment guide (VM + Caddy, Tailscale) | Built |
 
 ## Run it locally
 

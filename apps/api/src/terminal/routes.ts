@@ -10,9 +10,10 @@ import { HttpError } from '../http/errors.js';
 import type { AuthUser } from '../identity/sessions.js';
 import { resolveVariables } from '../variables/variables.js';
 import { issueAwsEnvForRun } from '../aws/aws.js';
+import { registerTerminalCounter } from '../workspaces/terminal-registry.js';
 import { getStsClient } from '../aws/sts.js';
 import { workspacePaths } from '../workspaces/paths.js';
-import { loadWorkspace, type WorkspaceRow } from '../workspaces/service.js';
+import { loadWorkspace, type WorkspaceRow, networkPolicyFor } from '../workspaces/service.js';
 import { ContainerShell } from './shell.js';
 
 /**
@@ -67,6 +68,7 @@ export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
   const open = new Map<string, Set<EndFn>>();
   const prepared = new WeakMap<FastifyRequest, Prepared>();
   const countFor = (id: string) => open.get(id)?.size ?? 0;
+  registerTerminalCounter(countFor);
 
   const record = (p: Prepared, action: string, details: Record<string, unknown>, outcome: 'success' | 'failure' = 'success') =>
     db
@@ -233,7 +235,7 @@ export async function terminalRoutes(app: FastifyInstance, deps: RouteDeps) {
       // The container may be stopped (after a restart) or need creating: bring it up first.
       const slow = setTimeout(() => send(Buffer.from('\x1b[2mStarting the workspace container…\x1b[0m\r\n')), 1500);
       try {
-        await runtime.ensure(workspacePaths(workspacesDir, wsId), { mode: p.ws.egressMode, hosts: p.ws.egressHosts });
+        await runtime.ensure(workspacePaths(workspacesDir, wsId), networkPolicyFor(p.ws));
       } catch (err) {
         const message = err instanceof HttpError ? err.message : 'The workspace container could not be started.';
         if (!(err instanceof HttpError)) app.log.error({ err }, 'terminal: runtime.ensure failed');

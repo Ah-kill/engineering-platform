@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import { ClaudeSdkDriver, type AgentEvent } from '../src/agents/driver.js';
 import { readSdkPackage } from '../src/agents/version.js';
 import { runGit } from '../src/git/git.js';
 import { defaultImage, DockerRuntime, separateGitDir, type WorkspaceDirs } from '../src/workspaces/runtime.js';
+import { registerTerminalCounter } from '../src/workspaces/terminal-registry.js';
 
 /**
  * Proves the container boundary with the real Docker engine and the real Claude Code
@@ -95,6 +96,39 @@ describe.skipIf(!dockerUp)('Docker workspace runtime', () => {
     await runtime.recycle(dirs.id);
     expect(Number(await sleepers())).toBe(before);
     expect(await readFile(path.join(dirs.repo, 'created.txt'), 'utf8')).toContain('from-container'); // files survive
+  }, 60_000);
+
+  const bridges = async () => Number((await exec(name, 'pgrep -c -f "/opt/platform/[p]ty-bridge.py" || true')).out);
+  async function waitForBridges(n: number) {
+    for (let i = 0; i < 40 && (await bridges()) !== n; i++) await new Promise((r) => setTimeout(r, 250));
+    return bridges();
+  }
+
+  it('cleanup keeps the real terminal shell and kills imitations started inside the container', async () => {
+    // A real terminal: started from the host with docker exec (its parent is outside the container).
+    const real = spawn('docker', ['exec', '-i', name, 'python3', '/opt/platform/pty-bridge.py', '80', '24'], { stdio: ['pipe', 'ignore', 'ignore'] });
+    expect(await waitForBridges(1)).toBe(1);
+    // Imitations started from inside, the way a hijacked agent could: once their starter exits
+    // they are adopted by the container's init (parent 1), which cannot be disguised.
+    await exec(name, 'nohup python3 /opt/platform/pty-bridge.py 80 24 </dev/null >/dev/null 2>&1 & exec -a "sleep" sleep 1000 >/dev/null 2>&1 &');
+    expect(await waitForBridges(2)).toBe(2);
+
+    registerTerminalCounter(() => 1);
+    await runtime.recycle(dirs.id);
+    registerTerminalCounter(() => 0);
+    expect(await bridges()).toBe(1); // the real one
+    expect((await exec(name, 'pgrep -c -f "[s]leep 1000" || true')).out).toBe('0');
+    real.stdin?.end();
+    expect(await waitForBridges(0)).toBe(0); // the bridge ends when its terminal closes
+  }, 60_000);
+
+  it('more terminal shells than the platform opened restarts the container', async () => {
+    const real = spawn('docker', ['exec', '-i', name, 'python3', '/opt/platform/pty-bridge.py', '80', '24'], { stdio: ['pipe', 'ignore', 'ignore'] });
+    expect(await waitForBridges(1)).toBe(1);
+    registerTerminalCounter(() => 0); // the platform knows of none
+    await runtime.recycle(dirs.id);
+    expect(await waitForBridges(0)).toBe(0);
+    real.kill();
   }, 60_000);
 
   describe('network policy', () => {

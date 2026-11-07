@@ -6,13 +6,13 @@ import { audit } from '../audit/audit.js';
 import { principalOf } from '../identity/user-routes.js';
 import { HttpError } from '../http/errors.js';
 import { claudeAuthEnv, MODEL_ID, readAgentSettings, readCredential } from '../settings/credentials.js';
-import { loadWorkspace } from '../workspaces/service.js';
+import { loadWorkspace, networkPolicyFor } from '../workspaces/service.js';
 import { workspacePaths } from '../workspaces/paths.js';
 import { agentEnv } from './driver.js';
 import { listModels } from './models.js';
 import { claudeCodeVersions } from './version.js';
 import { resolveVariables } from '../variables/variables.js';
-import { awsSecretValues, issueAwsEnvForRun, withAwsHosts } from '../aws/aws.js';
+import { awsSecretValues, issueAwsEnvForRun } from '../aws/aws.js';
 import { getStsClient } from '../aws/sts.js';
 import path from 'node:path';
 
@@ -155,7 +155,7 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
         // Broker values win over any same-named variable.
         appEnv: { ...ctx.vars.env, ...(aws ?? {}) },
         appSecrets: [...ctx.vars.secretValues, ...awsSecretValues(aws)],
-        network: { mode: ctx.ws.egressMode, hosts: withAwsHosts(ctx.ws.egressHosts, aws !== null) },
+        network: networkPolicyFor(ctx.ws),
       },
       { prompt: body.prompt, mode: body.mode, model: ctx.model, sessionId: body.sessionId },
     );

@@ -9,7 +9,7 @@ import * as git from '../git/git.js';
 import { createPullRequest, parseGithubRepo, repoInfo } from '../git/github.js';
 import { deleteRepoPath, listTree, readRepoFile, resolveInRepo, writeRepoFile } from './files.js';
 import { withWorkspaceLock, workspacePaths } from './paths.js';
-import { destroyWorkspaceFiles, githubToken, listWorkspaces, loadWorkspace, provisionWorkspace, touchWorkspace, type WorkspaceRow } from './service.js';
+import { destroyWorkspaceFiles, githubToken, listWorkspaces, loadWorkspace, networkPolicyFor, provisionWorkspace, touchWorkspace, type WorkspaceRow } from './service.js';
 
 const idParam = z.object({ id: z.string().uuid() });
 const pathQuery = z.object({ path: z.string().min(1).max(1024) });
@@ -127,7 +127,15 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
         clientId: app_?.client_id, applicationId: id, environmentId: body.environmentId,
         details: { branch: body.branch, baseBranch, createBranch: body.createBranch, repo: `${repo.owner}/${repo.name}` },
       });
-      return { workspaceId: ws!.id, repo, baseBranch, token: await githubToken(q, vault, user.id) };
+      const [envAws] = await q.query<{ aws_region: string | null; aws_configured: boolean }>(
+        'SELECT aws_region, (aws_role_arn IS NOT NULL) AS aws_configured FROM environments WHERE id = $1',
+        [body.environmentId],
+      );
+      const network = networkPolicyFor({
+        egressMode: repo.egress_mode, egressHosts: repo.egress_hosts,
+        awsRegion: envAws?.aws_region ?? null, awsConfigured: !!envAws?.aws_configured,
+      });
+      return { workspaceId: ws!.id, repo, baseBranch, network, token: await githubToken(q, vault, user.id) };
     });
 
     // Cloning can take a while: do it in the background; the UI polls the workspace state.
@@ -141,7 +149,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
       baseBranch: prepared.baseBranch,
       createBranch: body.createBranch,
       runtime,
-      network: { mode: prepared.repo.egress_mode, hosts: prepared.repo.egress_hosts },
+      network: prepared.network,
     });
     return reply.status(202).send({ id: prepared.workspaceId, state: 'creating' });
   });

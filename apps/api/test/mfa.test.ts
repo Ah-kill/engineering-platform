@@ -269,6 +269,37 @@ describe('two-step login', () => {
     expect((await next.b.post('/api/auth/login/mfa', { challenge: next.challenge, code: right })).statusCode).toBe(200);
   });
 
+  it('pauses two-step sign-in after 10 wrong codes across sign-in attempts', async () => {
+    await createUser('lock@mfa.test');
+    const { secret } = await enrol('lock@mfa.test');
+    await forgetLastStep('lock@mfa.test');
+    const wrong = wrongCode(secret);
+    // Spread over fresh challenges (each allows 5), so only the per-user limit can stop it.
+    for (let round = 0; round < 2; round++) {
+      const { b, challenge } = await passwordStep('lock@mfa.test');
+      for (let i = 0; i < 5; i++) expect((await b.post('/api/auth/login/mfa', { challenge, code: wrong })).statusCode).toBe(401);
+    }
+    // Now locked: no new challenge, even with the right password.
+    const r = await new Browser(env).post('/api/auth/login', { email: 'lock@mfa.test', password: PASSWORD });
+    expect(r.statusCode).toBe(429);
+    expect(r.json().error.code).toBe('mfa_locked');
+    // And after the pause ends, the right code works again.
+    await env.db.system((q) => q.query("UPDATE users SET mfa_locked_until = now() - interval '1 second' WHERE email = $1", ['lock@mfa.test']));
+    const { b, challenge } = await passwordStep('lock@mfa.test');
+    expect((await b.post('/api/auth/login/mfa', { challenge, code: totpCode(secret) })).statusCode).toBe(200);
+  });
+
+  it('a challenge issued before the lock cannot be used while locked', async () => {
+    await createUser('lock2@mfa.test');
+    const { secret } = await enrol('lock2@mfa.test');
+    await forgetLastStep('lock2@mfa.test');
+    const { b, challenge } = await passwordStep('lock2@mfa.test');
+    await env.db.system((q) => q.query("UPDATE users SET mfa_locked_until = now() + interval '10 minutes' WHERE email = $1", ['lock2@mfa.test']));
+    const r = await b.post('/api/auth/login/mfa', { challenge, code: totpCode(secret) });
+    expect(r.statusCode).toBe(429);
+    expect(b.cookie).toBeUndefined();
+  });
+
   it('rejects a replayed code', async () => {
     await createUser('carol@mfa.test');
     const { secret } = await enrol('carol@mfa.test');
