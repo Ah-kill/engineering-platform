@@ -61,6 +61,11 @@ interface ActiveRun {
   approvals: Map<string, (allow: boolean) => void>;
 }
 
+/** The part of a pino/Fastify logger the manager uses. */
+export interface AgentLogger {
+  error(obj: object, msg: string): void;
+}
+
 const APPROVAL_TIMEOUT_MS = 15 * 60 * 1000;
 const GB = 1024 ** 3;
 /** How long the disk guard may spend measuring a workspace before a run. */
@@ -83,7 +88,10 @@ export class AgentManager {
   private readonly subscribers = new Map<string, Set<(e: StoredEvent) => void>>();
   /** Workspaces measured comfortably under the disk limit, and when. */
   private readonly diskChecked = new Map<string, number>();
+  /** The last pending event write per conversation; record() chains onto it. */
+  private readonly writes = new Map<string, Promise<void>>();
   private limits: AgentLimits;
+  private logger?: AgentLogger;
 
   constructor(
     private readonly db: Database,
@@ -92,6 +100,11 @@ export class AgentManager {
     limits: AgentLimits,
   ) {
     this.limits = { maxMinutes: 30, maxWorkspaceGb: 10, ...limits };
+  }
+
+  /** Where background failures are reported (the agent routes pass the app's logger). */
+  setLogger(logger: AgentLogger): void {
+    this.logger = logger;
   }
 
   /** Adjusts limits after construction (the agent routes apply AGENT_MAX_MINUTES and WORKSPACE_MAX_GB). */
@@ -207,22 +220,35 @@ export class AgentManager {
     }
     run.sessionId = session.id;
 
-    await this.record(ctx, session.id, 'user', { prompt: input.prompt, mode: input.mode, model: input.model });
-    await this.record(ctx, session.id, 'status', { state: 'running', mode: input.mode });
-    await this.db.tenant(ctx.orgId, (q) =>
-      audit(q, {
-        orgId: ctx.orgId, actorId: ctx.userId, action: `agent.run.${input.mode}`, resourceType: 'agent_session', resourceId: session.id,
-        clientId: ctx.clientId, applicationId: ctx.applicationId, environmentId: ctx.environmentId,
-        details: {
-          workspaceId: ctx.workspaceId, model: input.model, authMode: ctx.authMode,
-          environmentKind: ctx.environmentKind, protected: ctx.protected, projectInstructions: !!ctx.instructions?.trim(),
-          // Names only, never values.
-          variables: Object.keys(ctx.appEnv).sort(),
-        },
-      }),
-    );
+    // From here until execute() takes over, a failure must release the reservation, or the
+    // workspace would refuse runs and token-bearing git until the server restarts.
+    try {
+      await this.record(ctx, session.id, 'user', { prompt: input.prompt, mode: input.mode, model: input.model });
+      await this.record(ctx, session.id, 'status', { state: 'running', mode: input.mode });
+      await this.db.tenant(ctx.orgId, (q) =>
+        audit(q, {
+          orgId: ctx.orgId, actorId: ctx.userId, action: `agent.run.${input.mode}`, resourceType: 'agent_session', resourceId: session.id,
+          clientId: ctx.clientId, applicationId: ctx.applicationId, environmentId: ctx.environmentId,
+          details: {
+            workspaceId: ctx.workspaceId, model: input.model, authMode: ctx.authMode,
+            environmentKind: ctx.environmentKind, protected: ctx.protected, projectInstructions: !!ctx.instructions?.trim(),
+            // Names only, never values.
+            variables: Object.keys(ctx.appEnv).sort(),
+          },
+        }),
+      );
+    } catch (err) {
+      // Close the conversation off in case its "running" status made it in, then release.
+      await this.record(ctx, session.id, 'status', { state: 'idle' }).catch(() => undefined);
+      if (this.runs.get(ctx.workspaceId) === run) this.runs.delete(ctx.workspaceId);
+      throw err;
+    }
 
-    void this.execute(ctx, run, { ...input, resume: session.resume });
+    void this.execute(ctx, run, { ...input, resume: session.resume }).catch((err: unknown) => {
+      // execute() handles its own errors; this is the last line of defence for the process.
+      if (this.runs.get(ctx.workspaceId) === run) this.runs.delete(ctx.workspaceId);
+      this.log('agent run failed in the background', err);
+    });
     return { sessionId: session.id };
   }
 
@@ -309,7 +335,8 @@ export class AgentManager {
     } catch (err) {
       const aborted = run.abortController.signal.aborted;
       if (timedOut) {
-        await this.record(ctx, run.sessionId, 'error', { message: `Stopped: the run exceeded ${formatMinutes(maxMinutes)} minutes.`, reason: 'time_limit' });
+        await this.record(ctx, run.sessionId, 'error', { message: `Stopped: the run exceeded ${formatMinutes(maxMinutes)} minutes.`, reason: 'time_limit' })
+          .catch((e: unknown) => this.log('could not record the time-limit error', e));
         await this.db
           .tenant(ctx.orgId, (q) =>
             audit(q, {
@@ -322,18 +349,22 @@ export class AgentManager {
       } else {
         const message = aborted ? 'Stopped by the developer.' : friendlyError(redactSecrets(String((err as Error)?.message ?? err), secrets));
         // The SDK throws after an error result; that result is already in the conversation.
-        if (aborted || !(planShown || errorResultShown)) await this.record(ctx, run.sessionId, aborted ? 'cancelled' : 'error', { message });
+        if (aborted || !(planShown || errorResultShown)) {
+          await this.record(ctx, run.sessionId, aborted ? 'cancelled' : 'error', { message })
+            .catch((e: unknown) => this.log('could not record the end of a run', e));
+        }
       }
     } finally {
       clearTimeout(deadline);
       // End every process the run started (including background ones) before the
       // workspace counts as idle and token-bearing git may run again.
       await this.runtime.recycle(ctx.workspaceId).catch(() => undefined);
-      this.runs.delete(ctx.workspaceId);
+      if (this.runs.get(ctx.workspaceId) === run) this.runs.delete(ctx.workspaceId);
       await this.db
         .tenant(ctx.orgId, (q) => q.query('UPDATE workspaces SET last_active_at = now() WHERE id = $1', [ctx.workspaceId]))
         .catch(() => undefined);
-      await this.record(ctx, run.sessionId, 'status', { state: 'idle' }).catch(() => undefined);
+      await this.record(ctx, run.sessionId, 'status', { state: 'idle' })
+        .catch((e: unknown) => this.log('could not record the idle status', e));
     }
   }
 
@@ -359,7 +390,23 @@ export class AgentManager {
     }
   }
 
-  private async record(ctx: RunContext, sessionId: string, kind: string, data: Record<string, unknown>): Promise<void> {
+  /**
+   * Persists an event and fans it out to live subscribers. Writes for one conversation are
+   * serialised, so event ids are assigned (and committed) in the order events happen and a
+   * stream never sees a lower id arrive after a higher one.
+   */
+  private record(ctx: RunContext, sessionId: string, kind: string, data: Record<string, unknown>): Promise<void> {
+    const previous = this.writes.get(sessionId) ?? Promise.resolve();
+    const write = previous.then(() => this.insertEvent(ctx, sessionId, kind, data));
+    const tail = write.catch(() => undefined);
+    this.writes.set(sessionId, tail);
+    void tail.then(() => {
+      if (this.writes.get(sessionId) === tail) this.writes.delete(sessionId);
+    });
+    return write;
+  }
+
+  private async insertEvent(ctx: RunContext, sessionId: string, kind: string, data: Record<string, unknown>): Promise<void> {
     const { kind: _k, ...rest } = data;
     const [row] = await this.db.tenant(ctx.orgId, (q) =>
       q.query<{ id: string; created_at: Date }>(
@@ -368,7 +415,17 @@ export class AgentManager {
       ),
     );
     const stored: StoredEvent = { id: row!.id, sessionId, kind, data: rest, createdAt: new Date(row!.created_at).toISOString() };
-    for (const fn of this.subscribers.get(sessionId) ?? []) fn(stored);
+    for (const fn of [...(this.subscribers.get(sessionId) ?? [])]) {
+      try {
+        fn(stored);
+      } catch (err) {
+        this.log('an event subscriber failed', err);
+      }
+    }
+  }
+
+  private log(message: string, err: unknown): void {
+    this.logger?.error({ err }, message);
   }
 }
 

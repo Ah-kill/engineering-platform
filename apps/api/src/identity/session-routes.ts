@@ -35,11 +35,9 @@ export async function sessionRoutes(app: FastifyInstance, { db, config }: RouteD
 
   app.get('/me/sessions', async (req): Promise<SessionView[]> => {
     const { user, sessionId } = caller(req);
-    // to_jsonb(s)->>'last_used_at' is NULL while the column does not exist, so a later
-    // migration that starts tracking it is picked up without changing this query.
     const rows = await db.system((q) =>
-      q.query<{ id: string; created_at: Date; last_used_at: string | null; expires_at: Date; ip: string | null; user_agent: string | null }>(
-        `SELECT s.id, s.created_at, to_jsonb(s)->>'last_used_at' AS last_used_at, s.expires_at, s.ip, s.user_agent
+      q.query<{ id: string; created_at: Date; last_used_at: Date | null; expires_at: Date; ip: string | null; user_agent: string | null }>(
+        `SELECT s.id, s.created_at, s.last_used_at, s.expires_at, s.ip, s.user_agent
            FROM sessions s
           WHERE s.user_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now()
           ORDER BY s.created_at DESC

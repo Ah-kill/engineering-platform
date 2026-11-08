@@ -101,7 +101,8 @@ export interface Workspace {
 export interface TreeEntry { path: string; type: 'file' | 'dir'; skipped?: boolean }
 
 export interface GitFile { path: string; code: string; status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked' }
-export interface GitStatus { branch: string; ahead: number; behind: number; files: GitFile[]; baseBranch: string; defaultBranch: string }
+/** `branch` is '' and `detached` true when HEAD is not on a branch (`head` is then the commit). */
+export interface GitStatus { branch: string; detached?: boolean; head?: string | null; ahead: number; behind: number; files: GitFile[]; baseBranch: string; defaultBranch: string }
 
 export interface AgentSession {
   id: string; title: string; model: string; authMode: string; costUsd: number;

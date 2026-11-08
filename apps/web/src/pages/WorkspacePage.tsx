@@ -48,6 +48,7 @@ export default function WorkspacePage() {
   const [sideTab, setSideTab] = useState<SideTab>('files');
   const [bottomTab, setBottomTab] = useState<BottomTab>('output');
   const [logLines, setLogLines] = useState<string[]>([]);
+  // Claude is running in this workspace (anyone's run, from ChatPanel): editing and git wait.
   const [agentBusy, setAgentBusy] = useState(false);
   const settings = useResource<AgentSettings>('/me/settings');
   const filesRef = useRef(files);
@@ -253,7 +254,7 @@ export default function WorkspacePage() {
         <div className="ide-title">
           <div className="ide-crumbs muted">{ws.clientName} / {ws.applicationName}</div>
           <div className="ide-branch">
-            <code>{status?.branch ?? ws.branch}</code> <span className={`badge${ws.environmentKind === 'production' ? ' warn' : ''}`}>{ws.environmentName}</span>
+            <code>{status?.detached ? `detached @ ${status.head?.slice(0, 7) ?? '?'}` : status?.branch || ws.branch}</code> <span className={`badge${ws.environmentKind === 'production' ? ' warn' : ''}`}>{ws.environmentName}</span>
             {!isOwner && <> <span className="badge" title={`Shared by ${ws.ownerName}`}>{readOnly ? 'view only' : 'shared'}</span></>}
           </div>
         </div>

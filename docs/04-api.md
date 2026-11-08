@@ -144,7 +144,7 @@ including parents of what they hold grants in, by name only).
 | GET | `/models` | any user | `?refresh=true` bypasses the cache | `{ models: [{ id, label, description, resolvedModel?, source: 'claude-code'\|'anthropic-api' }], fetchedAt, errors: string[] }`, discovered with the caller's own credential | |
 | GET | `/system/claude-code` | any user | | `{ sdk, claudeCode, latestSdk \| null, updateAvailable }` | |
 | GET | `/me/recent` | any user | | Up to 12 of your workspaces you can still use, each with its latest conversation: `[{ id, branch, state, lastActiveAt, environmentId, applicationId, applicationName, clientName, environmentName, sessionId, sessionTitle, sessionUpdatedAt, sessionCount, running }]` | |
-| GET | `/workspaces/:id/agent/sessions` | workspace access | | `{ sessions: [{ id, title, model, authMode, costUsd, inputTokens, outputTokens, createdAt, updatedAt }] (yours, ≤50), running, activeSessionId }` | |
+| GET | `/workspaces/:id/agent/sessions` | workspace access | | `{ sessions: [{ id, title, model, authMode, costUsd, inputTokens, outputTokens, createdAt, updatedAt }] (yours, ≤50), running (anyone's run in this workspace), runningBy: { name, you } \| null, activeSessionId (only when the run is yours) }` | |
 | POST | `/workspaces/:id/agent/run` | workspace access (write) | `{ prompt (1-50,000), mode: 'plan'\|'execute', model?, sessionId? (continue a conversation) }` | `{ sessionId }` immediately; the run continues in the background, follow it with the event stream | `409` already running or a git operation in progress, `400` no Claude credential / workspace not ready, `404` unknown conversation. `agent.run.plan` / `agent.run.execute`. Short-lived AWS credentials are issued when the environment has a role (`aws.credentials.issued`) |
 | POST | `/workspaces/:id/agent/cancel` | workspace access | | `{ cancelled: boolean }` (pending approvals are refused) | |
 | POST | `/workspaces/:id/agent/approvals/:approvalId` | workspace access | `{ allow: boolean }` | `{ ok: true }` | `404` no such pending approval (answered, timed out after 15 min, or run ended) |
@@ -287,8 +287,9 @@ Changes need `org.manage_users` (org admins). Amounts are US dollars, 0 to 1,000
 ### Budgets
 
 The monthly limit is the developer's override, else the organisation default, else none. Spend is the
-sum of `agent_sessions.cost_usd` of conversations the developer **started** in the current UTC calendar
-month (the same rule as the Usage page). `allowed` is false once spend reaches the limit.
+cost of every Claude run (`result` event) in the developer's conversations that **finished** in the
+current UTC calendar month, so a conversation started last month and resumed this month counts
+towards this month. `GET /org/budgets`, `GET /me/budget` and the per-run check all use this rule. `allowed` is false once spend reaches the limit.
 
 Server-side check, exported from `apps/api/src/org/budgets.ts` (re-exported by `src/org/routes.ts`):
 

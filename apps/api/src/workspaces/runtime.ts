@@ -29,6 +29,13 @@ export interface WorkspaceRuntime {
   recycle(workspaceId: string): Promise<void>;
   /** Stops the workspace's container (and proxy) to free memory; files are kept and `ensure` starts it again. */
   stop(workspaceId: string): Promise<void>;
+  /**
+   * Stops the container only if `isIdle()` still holds once no other container operation for the
+   * workspace is in flight, deciding and stopping as one step (the idle reaper uses it, so a run
+   * or terminal starting meanwhile is never cut off). Resolves true when it stopped. Runtimes
+   * without it are stopped with `stop` after an `isIdle()` check.
+   */
+  stopIfIdle?(workspaceId: string, isIdle: () => boolean): Promise<boolean>;
   remove(workspaceId: string): Promise<void>;
   /** Spawns Claude Code inside the workspace, or undefined to spawn on the host. */
   spawnClaude?(workspaceId: string, options: SpawnOptions): SpawnedProcess;
@@ -152,14 +159,17 @@ export function defaultImage(claudeCodeVersion: string): string {
 }
 const RUNTIME_DIR = fileURLToPath(new URL('../../../runtime/', import.meta.url));
 
-function run(args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+/** Runs the docker CLI and resolves its stdout. Replaceable in DockerRuntime for tests. */
+export type DockerCli = (args: string[], opts?: { timeoutMs?: number; env?: NodeJS.ProcessEnv }) => Promise<string>;
+
+const run: DockerCli = (args, opts = {}) => {
   return new Promise((resolve, reject) => {
     execFile('docker', args, { timeout: opts.timeoutMs ?? 120_000, windowsHide: true, maxBuffer: 16 * 1024 * 1024, env: opts.env }, (err, stdout, stderr) => {
       if (err) reject(new Error(`docker ${args[0]} failed: ${(stderr || err.message).trim().split('\n').slice(-3).join(' ')}`));
       else resolve(stdout);
     });
   });
-}
+};
 
 /** Environment for the docker CLI itself: the server's, minus platform secrets. */
 function dockerClientEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -181,8 +191,31 @@ export class DockerRuntime implements WorkspaceRuntime {
   readonly kind = 'docker' as const;
   readonly repoPathForAgent = () => CONTAINER_REPO;
   private imageReady: Promise<void> | undefined;
+  /**
+   * The tail of each workspace's chain of container operations. ensure, recycle, stop and remove
+   * for one workspace run one after another, never interleaved: otherwise a terminal opening while
+   * a run starts could race `docker rm -f` of the proxy against `docker run --name`, or a stop
+   * could land in the middle of an ensure.
+   */
+  private readonly chains = new Map<string, Promise<unknown>>();
 
-  constructor(private readonly opts: DockerRuntimeOptions) {}
+  constructor(
+    private readonly opts: DockerRuntimeOptions,
+    private readonly docker: DockerCli = run,
+  ) {}
+
+  /** Runs `fn` after every container operation already queued for the workspace has settled. */
+  private serial<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.chains.get(workspaceId) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(fn);
+    this.chains.set(workspaceId, next);
+    next
+      .finally(() => {
+        if (this.chains.get(workspaceId) === next) this.chains.delete(workspaceId);
+      })
+      .catch(() => undefined);
+    return next;
+  }
 
   static containerName(workspaceId: string) {
     return `ep-ws-${workspaceId}`;
@@ -195,9 +228,9 @@ export class DockerRuntime implements WorkspaceRuntime {
 
   private ensureImage(): Promise<void> {
     this.imageReady ??= (async () => {
-      const exists = await run(['image', 'inspect', this.opts.image]).then(() => true, () => false);
+      const exists = await this.docker(['image', 'inspect', this.opts.image]).then(() => true, () => false);
       if (!exists) {
-        await run(['build', '--build-arg', `CLAUDE_CODE_VERSION=${this.opts.claudeCodeVersion}`, '-t', this.opts.image, RUNTIME_DIR], {
+        await this.docker(['build', '--build-arg', `CLAUDE_CODE_VERSION=${this.opts.claudeCodeVersion}`, '-t', this.opts.image, RUNTIME_DIR], {
           timeoutMs: 30 * 60_000,
         });
       }
@@ -221,8 +254,13 @@ export class DockerRuntime implements WorkspaceRuntime {
     return createHash('sha256').update(`${policy.mode}|${hosts.join(',')}|${RUNTIME_REVISION}`).digest('hex').slice(0, 16);
   }
 
-  async ensure(ws: WorkspaceDirs, network: NetworkPolicy = { mode: 'restricted', hosts: [] }): Promise<void> {
-    if (!(await DockerRuntime.available())) {
+  ensure(ws: WorkspaceDirs, network: NetworkPolicy = { mode: 'restricted', hosts: [] }): Promise<void> {
+    return this.serial(ws.id, () => this.ensureNow(ws, network));
+  }
+
+  private async ensureNow(ws: WorkspaceDirs, network: NetworkPolicy): Promise<void> {
+    const available = await this.docker(['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 15_000 }).then(() => true, () => false);
+    if (!available) {
       throw new HttpError(503, 'runtime_unavailable', 'Docker is not running. Start Docker Desktop and try again.');
     }
     await separateGitDir(ws);
@@ -230,14 +268,14 @@ export class DockerRuntime implements WorkspaceRuntime {
     const proxy = DockerRuntime.proxyName(ws.id);
     const hash = DockerRuntime.policyHash(network);
 
-    const inspect = await run(['container', 'inspect', '--format', '{{.State.Status}} {{index .Config.Labels "engineering-platform.policy"}}', name])
+    const inspect = await this.docker(['container', 'inspect', '--format', '{{.State.Status}} {{index .Config.Labels "engineering-platform.policy"}}', name])
       .then((s) => s.trim().split(' '), () => null);
     if (inspect && inspect[1] !== hash) {
       // Policy changed: rebuild the container and its network setup around the same files.
-      await this.remove(ws.id);
+      await this.removeNow(ws.id);
     } else if (inspect) {
-      if (network.mode === 'restricted') await run(['start', proxy]).catch(() => undefined);
-      if (inspect[0] !== 'running') await run(['start', name]);
+      if (network.mode === 'restricted') await this.docker(['start', proxy]).catch(() => undefined);
+      if (inspect[0] !== 'running') await this.docker(['start', name]);
       return;
     }
 
@@ -246,9 +284,9 @@ export class DockerRuntime implements WorkspaceRuntime {
     if (network.mode === 'restricted') {
       const net = DockerRuntime.networkName(ws.id);
       // --internal: no route to the outside world; the proxy is the only exit.
-      await run(['network', 'create', '--internal', '--label', `engineering-platform.workspace=${ws.id}`, net]).catch(() => undefined);
-      await run(['rm', '-f', proxy]).catch(() => undefined);
-      await run([
+      await this.docker(['network', 'create', '--internal', '--label', `engineering-platform.workspace=${ws.id}`, net]).catch(() => undefined);
+      await this.docker(['rm', '-f', proxy]).catch(() => undefined);
+      await this.docker([
         'run', '-d',
         '--name', proxy,
         '--label', `engineering-platform.workspace=${ws.id}`,
@@ -264,14 +302,14 @@ export class DockerRuntime implements WorkspaceRuntime {
         this.opts.image,
         'node', '/opt/platform/egress-proxy.mjs',
       ]);
-      await run(['network', 'connect', net, proxy]);
+      await this.docker(['network', 'connect', net, proxy]);
       const proxyUrl = `http://${proxy}:3128`;
       netArgs.push('--network', net);
       for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) netArgs.push('-e', `${k}=${proxyUrl}`);
       netArgs.push('-e', 'NO_PROXY=localhost,127.0.0.1', '-e', 'no_proxy=localhost,127.0.0.1', '-e', 'NODE_USE_ENV_PROXY=1');
     }
 
-    await run([
+    await this.docker([
       'run', '-d',
       '--name', name,
       '--label', 'engineering-platform.workspace=' + ws.id,
@@ -300,25 +338,45 @@ export class DockerRuntime implements WorkspaceRuntime {
     ]);
   }
 
-  async recycle(workspaceId: string): Promise<void> {
+  recycle(workspaceId: string): Promise<void> {
+    return this.serial(workspaceId, () => this.recycleNow(workspaceId));
+  }
+
+  private async recycleNow(workspaceId: string): Promise<void> {
     // End everything the agent left behind (including background processes) but keep the
     // container's init, its keep-alive process and the developer's terminal shells. Shells are
     // recognised as started by docker exec and counted against the terminals the platform has
     // open; any surplus, or any failure, restarts the container (ends every process, keeps files).
     const name = DockerRuntime.containerName(workspaceId);
-    const swept = await run(['exec', '-e', 'PATH=/usr/bin:/bin', name, '/usr/bin/python3', '-I', '-c', SWEEP_SCRIPT, String(openTerminals(workspaceId))], { timeoutMs: 20_000 }).then(() => true, () => false);
-    if (!swept) await run(['restart', '-t', '2', name]).catch(() => undefined);
+    const swept = await this.docker(['exec', '-e', 'PATH=/usr/bin:/bin', name, '/usr/bin/python3', '-I', '-c', SWEEP_SCRIPT, String(openTerminals(workspaceId))], { timeoutMs: 20_000 }).then(() => true, () => false);
+    if (!swept) await this.docker(['restart', '-t', '2', name]).catch(() => undefined);
   }
 
-  async stop(workspaceId: string): Promise<void> {
+  stop(workspaceId: string): Promise<void> {
+    return this.serial(workspaceId, () => this.stopNow(workspaceId));
+  }
+
+  stopIfIdle(workspaceId: string, isIdle: () => boolean): Promise<boolean> {
+    return this.serial(workspaceId, async () => {
+      if (!isIdle()) return false;
+      await this.stopNow(workspaceId);
+      return true;
+    });
+  }
+
+  private async stopNow(workspaceId: string): Promise<void> {
     // One call per container: `docker stop a b` fails as a whole when one of them does not exist.
-    await run(['stop', '-t', '5', DockerRuntime.containerName(workspaceId)], { timeoutMs: 60_000 }).catch(() => undefined);
-    await run(['stop', '-t', '2', DockerRuntime.proxyName(workspaceId)], { timeoutMs: 60_000 }).catch(() => undefined);
+    await this.docker(['stop', '-t', '5', DockerRuntime.containerName(workspaceId)], { timeoutMs: 60_000 }).catch(() => undefined);
+    await this.docker(['stop', '-t', '2', DockerRuntime.proxyName(workspaceId)], { timeoutMs: 60_000 }).catch(() => undefined);
   }
 
-  async remove(workspaceId: string): Promise<void> {
-    await run(['rm', '-f', DockerRuntime.containerName(workspaceId), DockerRuntime.proxyName(workspaceId)]).catch(() => undefined);
-    await run(['network', 'rm', DockerRuntime.networkName(workspaceId)]).catch(() => undefined);
+  remove(workspaceId: string): Promise<void> {
+    return this.serial(workspaceId, () => this.removeNow(workspaceId));
+  }
+
+  private async removeNow(workspaceId: string): Promise<void> {
+    await this.docker(['rm', '-f', DockerRuntime.containerName(workspaceId), DockerRuntime.proxyName(workspaceId)]).catch(() => undefined);
+    await this.docker(['network', 'rm', DockerRuntime.networkName(workspaceId)]).catch(() => undefined);
   }
 
   spawnClaude(workspaceId: string, options: SpawnOptions): SpawnedProcess {

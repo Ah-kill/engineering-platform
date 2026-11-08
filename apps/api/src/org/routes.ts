@@ -7,7 +7,7 @@ import { caller, type RouteDeps } from '../http/app.js';
 import { HttpError } from '../http/errors.js';
 import type { AuthUser } from '../identity/sessions.js';
 import { principalOf } from '../identity/user-routes.js';
-import { budgetDetail, cents, monthBounds } from './budgets.js';
+import { budgetDetail, cents, monthBounds, spendByUser } from './budgets.js';
 
 export { checkMonthlyBudget, requireWithinBudget, budgetExceeded, type BudgetStatus } from './budgets.js';
 
@@ -105,29 +105,28 @@ export async function orgRoutes(app: FastifyInstance, { db }: RouteDeps) {
     const { user } = caller(req);
     return db.tenant(user.orgId, async (q) => {
       await requireAdmin(q, user);
-      const { start, end, month } = monthBounds();
+      const now = new Date();
+      const { month } = monthBounds(now);
       const [org] = await q.query<{ monthlyBudgetUsd: number | null }>(
         `SELECT monthly_budget_usd::float8 AS "monthlyBudgetUsd" FROM organizations WHERE id = $1`,
         [user.orgId],
       );
       const defaultUsd = org?.monthlyBudgetUsd ?? null;
-      const rows = await q.query<{ userId: string; email: string; displayName: string; status: string; overrideUsd: number | null; spentUsd: number }>(
+      const rows = await q.query<{ userId: string; email: string; displayName: string; status: string; overrideUsd: number | null }>(
         `SELECT u.id AS "userId", u.email, u.display_name AS "displayName", u.status,
-                ub.monthly_budget_usd::float8 AS "overrideUsd",
-                coalesce(sp.spent, 0)::float8 AS "spentUsd"
+                ub.monthly_budget_usd::float8 AS "overrideUsd"
            FROM users u
            LEFT JOIN user_budgets ub ON ub.user_id = u.id
-           LEFT JOIN (SELECT user_id, sum(cost_usd) AS spent FROM agent_sessions
-                       WHERE created_at >= $1::timestamptz AND created_at < $2::timestamptz GROUP BY user_id) sp ON sp.user_id = u.id
           ORDER BY u.status, u.display_name`,
-        [start.toISOString(), end.toISOString()],
       );
+      // The same spend rule as the per-run budget check, so the two always agree.
+      const spend = await spendByUser(q, now);
       return {
         month,
         defaultUsd,
         users: rows.map((r) => {
           const limitUsd = r.overrideUsd ?? defaultUsd;
-          const spentUsd = Math.round(r.spentUsd * 1e6) / 1e6;
+          const spentUsd = spend.get(r.userId) ?? 0;
           return { ...r, spentUsd, limitUsd, allowed: limitUsd === null || spentUsd < limitUsd };
         }),
       };

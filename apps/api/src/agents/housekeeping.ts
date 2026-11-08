@@ -97,8 +97,15 @@ export async function reapIdleWorkspaces(db: Database, runtime: WorkspaceRuntime
   const stoppedNow: string[] = [];
   for (const r of rows) {
     if (opts.stopped?.get(r.id) === r.last) continue;
-    if (isRunning(r.id) || openTerminals(r.id) > 0) continue;
-    await runtime.stop(r.id).catch(() => undefined);
+    const idle = () => !isRunning(r.id) && openTerminals(r.id) === 0;
+    if (!idle()) continue;
+    // A run or terminal can start between the check above and the stop. The runtime re-checks
+    // inside its per-workspace queue, so the decision and the stop happen as one step: a run
+    // that starts first is seen as running, one that starts later queues its ensure behind the stop.
+    const didStop = runtime.stopIfIdle
+      ? await runtime.stopIfIdle(r.id, idle).catch(() => true)
+      : await runtime.stop(r.id).then(() => true, () => true);
+    if (!didStop) continue;
     opts.stopped?.set(r.id, r.last);
     stoppedNow.push(r.id);
   }

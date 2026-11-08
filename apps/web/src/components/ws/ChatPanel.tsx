@@ -2,7 +2,18 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEven
 import { api, type AgentEventRow, type AgentSession, type ModelOption } from '../../api';
 import { useAction, useResource } from '../../hooks';
 
-interface SessionsResponse { sessions: AgentSession[]; running: boolean; activeSessionId: string | null }
+interface SessionsResponse {
+  sessions: AgentSession[];
+  /** Claude is running in this workspace, whoever started it. */
+  running: boolean;
+  /** Who started the run; `you` when it is the caller. */
+  runningBy?: { name: string; you: boolean } | null;
+  /** The running conversation, only when it is the caller's. */
+  activeSessionId: string | null;
+}
+
+/** How often the panel re-checks a run it cannot follow live (someone else's, or another conversation). */
+const RUN_POLL_MS = 4000;
 
 const APPROVE_PLAN = 'The plan is approved. Implement it now, then run the relevant tests and summarise the result.';
 
@@ -12,6 +23,7 @@ export function ChatPanel({ wsId, initialSessionId, defaultModel, onRunFinished,
   initialSessionId?: string | null;
   defaultModel: string;
   onRunFinished(): void;
+  /** Whether Claude is running in the workspace (anyone's run): file saves wait meanwhile. */
   onRunningChange(running: boolean): void;
 }) {
   const sessions = useResource<SessionsResponse>(`/workspaces/${wsId}/agent/sessions`);
@@ -42,17 +54,17 @@ export function ChatPanel({ wsId, initialSessionId, defaultModel, onRunFinished,
   useEffect(() => {
     setEvents([]);
     if (!sessionId) return;
-    let last = 0;
+    const seen = new Set<string>();
     const es = new EventSource(`/api/agent/sessions/${sessionId}/events?after=0`);
     es.addEventListener('agent', (msg) => {
       const ev = JSON.parse((msg as MessageEvent).data) as AgentEventRow;
-      if (Number(ev.id) <= last) return;
-      last = Number(ev.id);
+      // A reconnect replays the conversation from the start; keep each event once.
+      if (seen.has(ev.id)) return;
+      seen.add(ev.id);
       setEvents((prev) => [...prev, ev]);
-      if (ev.kind === 'status' && ev.data.state === 'idle') {
-        finished.current();
-        void sessions.reload();
-      }
+      // The server's workspace-wide state is the source of truth for "running".
+      if (ev.kind === 'status') void sessions.reload();
+      if (ev.kind === 'status' && ev.data.state === 'idle') finished.current();
     });
     return () => es.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -63,12 +75,34 @@ export function ChatPanel({ wsId, initialSessionId, defaultModel, onRunFinished,
     if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 240) el.scrollTop = el.scrollHeight;
   }, [events]);
 
-  const running = useMemo(() => {
+  // What this conversation's events say. On its own this can be stale (a run interrupted by a
+  // restart never wrote "idle"), so it only counts while the server confirms a run.
+  const streamRunning = useMemo(() => {
     const statuses = events.filter((e) => e.kind === 'status');
     return statuses.at(-1)?.data.state === 'running';
   }, [events]);
+  const running = sessions.data?.running ?? false;
+  const runningBy = running ? sessions.data?.runningBy ?? null : null;
+  const thisRunning = running && streamRunning;
+  const othersRunning = running && !!runningBy && !runningBy.you;
 
   useEffect(() => onRunningChange(running), [running, onRunningChange]);
+
+  // A run ended that this panel did not follow (someone else's, or another conversation):
+  // refresh files and changes too.
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (wasRunning.current && !running) finished.current();
+    wasRunning.current = running;
+  }, [running]);
+
+  // A run this panel cannot follow live: check until it ends.
+  useEffect(() => {
+    if (!running || thisRunning) return;
+    const t = setInterval(() => void sessions.reload(), RUN_POLL_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, thisRunning]);
 
   const pendingApprovals = useMemo(() => {
     const decided = new Set(events.filter((e) => e.kind === 'approval_decision').map((e) => e.data.approvalId));
@@ -81,7 +115,7 @@ export function ChatPanel({ wsId, initialSessionId, defaultModel, onRunFinished,
     });
     setPrompt('');
     if (r.sessionId !== sessionId) setSessionId(r.sessionId);
-    void sessions.reload();
+    await sessions.reload();
   });
   const stop = useAction(() => api('POST', `/workspaces/${wsId}/agent/cancel`));
   const remove = useAction(async (id: string) => {
@@ -94,7 +128,7 @@ export function ChatPanel({ wsId, initialSessionId, defaultModel, onRunFinished,
 
   const submit = (e?: FormEvent) => {
     e?.preventDefault();
-    if (prompt.trim() && !running) void send.run(prompt.trim(), mode);
+    if (prompt.trim() && !running && !send.pending) void send.run(prompt.trim(), mode);
   };
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit();
@@ -134,7 +168,16 @@ export function ChatPanel({ wsId, initialSessionId, defaultModel, onRunFinished,
             onDecide={(id, allow) => void decide.run(id, allow)}
             onApprovePlan={() => void send.run(APPROVE_PLAN, 'execute')} running={running} />
         ))}
-        {running && <div className="chat-working"><span className="spinner" aria-hidden /> Claude is working…</div>}
+        {running && (
+          <div className="chat-working">
+            <span className="spinner" aria-hidden />{' '}
+            {othersRunning
+              ? `Claude is working for ${runningBy!.name}…`
+              : thisRunning || !sessionId
+                ? 'Claude is working…'
+                : 'Claude is working in another conversation…'}
+          </div>
+        )}
       </div>
 
       <form className="chat-input" onSubmit={submit}>

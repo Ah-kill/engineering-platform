@@ -63,7 +63,9 @@ export function ChangesPanel({ wsId, status, onOpenDiff, onChanged, log, busy, r
   return (
     <div className="panel-pad stack" style={{ gap: 12 }}>
       <div className="muted" style={{ fontSize: 13 }}>
-        On <code>{status.branch}</code>
+        {status.detached
+          ? <>Detached HEAD at <code>{status.head?.slice(0, 7) ?? '?'}</code>: switch to a branch to commit, push or pull</>
+          : <>On <code>{status.branch}</code></>}
         {status.ahead > 0 && <> · {status.ahead} to push</>}
         {status.behind > 0 && <> · {status.behind} behind</>}
         {readOnly && <> · <span className="badge">view only</span></>}

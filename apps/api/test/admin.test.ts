@@ -346,6 +346,7 @@ describe('per-developer budgets', () => {
 describe('checkMonthlyBudget', () => {
   const NOW = new Date('2026-04-15T12:00:00Z');
   let otherId: string;
+  let resumedId: string;
 
   beforeAll(async () => {
     otherId = (await admin.post('/api/users', { email: 'other@adm.test', displayName: 'Other', password: PASSWORD })).json().id;
@@ -359,18 +360,32 @@ describe('checkMonthlyBudget', () => {
          VALUES ($1, $2, $3, $4, $5, 'f', 'main', 'ready') RETURNING id`,
         [orgId, a!.id, e!.id, r!.id, devId],
       );
-      const session = (userId: string, cost: number, at: string) =>
-        q.query(
+      // Spend is counted per run (`result` event) by when the run happened. The conversation's
+      // own cost_usd and created_at are set to misleading values on purpose.
+      const session = async (userId: string, createdAt: string) => {
+        const [s] = await q.query<{ id: string }>(
           `INSERT INTO agent_sessions (org_id, workspace_id, user_id, model, auth_mode, cost_usd, created_at, updated_at)
-           VALUES ($1, $2, $3, 'm', 'api_key', $4, $5, $5)`,
-          [orgId, w!.id, userId, cost, at],
+           VALUES ($1, $2, $3, 'm', 'api_key', 0, $4, $4) RETURNING id`,
+          [orgId, w!.id, userId, createdAt],
         );
-      await session(devId, 100, '2026-03-31T23:59:59.999Z'); // last month
-      await session(devId, 2.25, '2026-04-01T00:00:00Z'); // first instant of the month
-      await session(devId, 0.123456, '2026-04-10T09:00:00Z');
-      await session(devId, 5.126544, '2026-04-30T23:59:59.999Z'); // last instant of the month
-      await session(devId, 40, '2026-05-01T00:00:00Z'); // next month
-      await session(otherId, 9, '2026-04-12T00:00:00Z'); // someone else
+        return s!.id;
+      };
+      const run = async (sessionId: string, cost: number, at: string, data: Record<string, unknown> = { costUsd: cost }) => {
+        await q.query(`INSERT INTO agent_events (org_id, session_id, kind, data, created_at) VALUES ($1, $2, 'result', $3, $4)`, [orgId, sessionId, JSON.stringify(data), at]);
+        await q.query('UPDATE agent_sessions SET cost_usd = cost_usd + $2 WHERE id = $1', [sessionId, cost]);
+      };
+      // A March conversation, resumed in April: only the April run counts in April.
+      resumedId = await session(devId, '2026-03-20T10:00:00Z');
+      await run(resumedId, 100, '2026-03-31T23:59:59.999Z'); // last month
+      await run(resumedId, 2.25, '2026-04-01T00:00:00Z'); // first instant of the month
+      const april = await session(devId, '2026-04-10T09:00:00Z');
+      await run(april, 0.123456, '2026-04-10T09:00:00Z');
+      await run(april, 5.126544, '2026-04-30T23:59:59.999Z'); // last instant of the month
+      await run(april, 40, '2026-05-01T00:00:00Z'); // next month, same conversation
+      // Other kinds of events and malformed costs never count.
+      await q.query(`INSERT INTO agent_events (org_id, session_id, kind, data, created_at) VALUES ($1, $2, 'text', '{"costUsd": 1000}', '2026-04-11T00:00:00Z')`, [orgId, april]);
+      await run(april, 0, '2026-04-12T00:00:00Z', { costUsd: 'lots' });
+      await run(await session(otherId, '2026-04-12T00:00:00Z'), 9, '2026-04-12T00:00:00Z'); // someone else
     });
   });
 
@@ -392,6 +407,14 @@ describe('checkMonthlyBudget', () => {
     expect(await check(otherId)).toEqual({ limitUsd: null, spentUsd: 9, allowed: true });
     expect(monthBounds(NOW)).toEqual({ start: new Date('2026-04-01T00:00:00Z'), end: new Date('2026-05-01T00:00:00Z'), month: '2026-04' });
     expect(monthBounds(new Date('2026-12-31T23:59:59Z')).end).toEqual(new Date('2027-01-01T00:00:00Z'));
+  });
+
+  it('counts a resumed conversation by when each run happened, not when the conversation started', async () => {
+    const [s] = await env.db.system((q) => q.query<{ cost: number; created: Date }>('SELECT cost_usd::float8 AS cost, created_at AS created FROM agent_sessions WHERE id = $1', [resumedId]));
+    expect(s).toEqual({ cost: 102.25, created: new Date('2026-03-20T10:00:00Z') });
+    expect((await env.db.tenant(orgId, (q) => checkMonthlyBudget(q, orgId, devId, new Date('2026-03-15T00:00:00Z')))).spentUsd).toBe(100);
+    expect((await check()).spentUsd).toBe(7.5);
+    expect((await env.db.tenant(orgId, (q) => checkMonthlyBudget(q, orgId, devId, new Date('2026-05-02T00:00:00Z')))).spentUsd).toBe(40);
   });
 
   it('uses the organisation default, then the override, and blocks once spend reaches the limit', async () => {

@@ -18,6 +18,8 @@ import { requireWithinBudget } from '../org/budgets.js';
 import { terminalUsers } from '../workspaces/terminal-registry.js';
 import { registerRunCheck } from './housekeeping.js';
 import path from 'node:path';
+import type { ServerResponse } from 'node:http';
+import type { StoredEvent } from './manager.js';
 
 const idParam = z.object({ id: z.string().uuid() });
 /** Largest transcript returned at once; conversations are far smaller in practice. */
@@ -36,9 +38,17 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
   const { db, vault, agents, workspacesDir, config } = deps;
   // Run limits from configuration, and let the idle reaper (main.ts) see which workspaces are busy.
   agents.configure({ maxMinutes: config.AGENT_MAX_MINUTES, maxWorkspaceGb: config.WORKSPACE_MAX_GB });
+  agents.setLogger(app.log);
   const unregister = registerRunCheck((id) => agents.isRunning(id));
   app.addHook('onClose', async () => {
     unregister();
+  });
+  // Open event streams never end on their own. End them before the server closes, or
+  // app.close() (shutdown) would wait for every open chat panel.
+  const streams = new Set<ServerResponse>();
+  app.addHook('preClose', async () => {
+    for (const res of streams) res.end();
+    streams.clear();
   });
 
   /** Models available to the caller's account, discovered live (see agents/models.ts). */
@@ -126,7 +136,20 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
            FROM agent_sessions WHERE workspace_id = $1 AND user_id = $2 ORDER BY updated_at DESC LIMIT 50`,
         [id, user.id],
       );
-      return { sessions, running: agents.isRunning(id), activeSessionId: agents.activeSession(id) ?? null };
+      // `running` is workspace-wide (one run per workspace, whoever started it). The running
+      // conversation is only named to the person it belongs to; others see who is running.
+      const runUser = agents.runUser(id);
+      let runningBy: { name: string; you: boolean } | null = null;
+      if (runUser) {
+        const [u] = await q.query<{ name: string }>('SELECT display_name AS name FROM users WHERE id = $1', [runUser]);
+        runningBy = { name: u?.name ?? 'someone else', you: runUser === user.id };
+      }
+      return {
+        sessions,
+        running: agents.isRunning(id),
+        runningBy,
+        activeSessionId: runUser === user.id ? agents.activeSession(id) ?? null : null,
+      };
     });
   });
 
@@ -289,42 +312,71 @@ export async function agentRoutes(app: FastifyInstance, deps: RouteDeps) {
 
   /**
    * Server-sent events for one conversation: replays stored events after `after`, then
-   * streams new ones live. The browser reconnects with the last id it saw.
+   * streams new ones live. The browser reconnects with the last id it saw. Streams are
+   * ended when the server shuts down (see the preClose hook above).
    */
   app.get('/agent/sessions/:id/events', async (req, reply) => {
     const { user } = caller(req);
     const { id } = idParam.parse(req.params);
     const { after } = eventsQuery.parse(req.query);
-    const history = await db.tenant(user.orgId, async (q) => {
-      const [s] = await q.query<{ workspace_id: string; user_id: string }>('SELECT workspace_id, user_id FROM agent_sessions WHERE id = $1', [id]);
-      if (!s || s.user_id !== user.id) throw HttpError.notFound();
-      await loadWorkspace(q, user, s.workspace_id, { access: 'read' });
-      return q.query<{ id: string; kind: string; data: unknown; created_at: Date }>(
-        'SELECT e.id::text AS id, e.kind, e.data, e.created_at FROM agent_events e WHERE e.session_id = $1 AND e.id > $2 ORDER BY e.id',
-        [id, after],
-      );
-    });
+    // Subscribe before reading history so nothing recorded in between is lost; live events
+    // are buffered until the history has been sent, and duplicates are dropped by id.
+    const buffered: StoredEvent[] = [];
+    let deliver: ((e: StoredEvent) => void) | undefined;
+    const unsubscribe = agents.subscribe(id, (e) => (deliver ? deliver(e) : buffered.push(e)));
+    let history: { id: string; kind: string; data: unknown; created_at: Date }[];
+    try {
+      history = await db.tenant(user.orgId, async (q) => {
+        const [s] = await q.query<{ workspace_id: string; user_id: string }>('SELECT workspace_id, user_id FROM agent_sessions WHERE id = $1', [id]);
+        if (!s || s.user_id !== user.id) throw HttpError.notFound();
+        await loadWorkspace(q, user, s.workspace_id, { access: 'read' });
+        return q.query<{ id: string; kind: string; data: unknown; created_at: Date }>(
+          'SELECT e.id::text AS id, e.kind, e.data, e.created_at FROM agent_events e WHERE e.session_id = $1 AND e.id > $2 ORDER BY e.id',
+          [id, after],
+        );
+      });
+    } catch (err) {
+      unsubscribe();
+      throw err;
+    }
 
     reply.hijack();
     const res = reply.raw;
+    let ping: NodeJS.Timeout | undefined;
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(ping);
+      unsubscribe();
+      streams.delete(res);
+    };
+    // The client may have gone while the history was read; its close event has then fired already.
+    if (req.raw.destroyed || res.destroyed || !res.socket || res.socket.destroyed) {
+      cleanup();
+      res.destroy();
+      return;
+    }
+    req.raw.on('close', cleanup);
+    res.on('close', cleanup);
+    streams.add(res);
+
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
     });
-    let lastId = after;
+    const sent = new Set<string>();
     const send = (e: { id: string; kind: string; data: unknown; createdAt: string }) => {
-      if (Number(e.id) <= lastId) return;
-      lastId = Number(e.id);
+      if (closed || sent.has(e.id) || Number(e.id) <= after) return;
+      sent.add(e.id);
       res.write(`id: ${e.id}\nevent: agent\ndata: ${JSON.stringify(e)}\n\n`);
     };
-    const unsubscribe = agents.subscribe(id, (e) => send(e));
     for (const e of history) send({ id: e.id, kind: e.kind, data: e.data, createdAt: new Date(e.created_at).toISOString() });
-    const ping = setInterval(() => res.write(': ping\n\n'), 20_000);
-    req.raw.on('close', () => {
-      clearInterval(ping);
-      unsubscribe();
-    });
+    for (const e of buffered.sort((a, b) => Number(a.id) - Number(b.id))) send(e);
+    buffered.length = 0;
+    deliver = send;
+    ping = setInterval(() => res.write(': ping\n\n'), 20_000);
   });
 }

@@ -194,14 +194,44 @@ export async function provisionWorkspace(
     }
     await separateGitDir(paths);
     await opts.runtime.ensure(paths, opts.network);
-    await db.tenant(opts.orgId, (q) => q.query(`UPDATE workspaces SET state = 'ready', error = NULL WHERE id = $1`, [opts.workspaceId]));
-  } catch (err) {
-    await opts.runtime.remove(opts.workspaceId).catch(() => undefined);
-    await rm(paths.root, { recursive: true, force: true }).catch(() => undefined);
-    await db.tenant(opts.orgId, (q) =>
-      q.query(`UPDATE workspaces SET state = 'failed', error = $2 WHERE id = $1`, [opts.workspaceId, String((err as Error).message).slice(0, 1000)]),
+    // Only a workspace still being set up becomes ready. If it was deleted meanwhile (the delete
+    // route already removed its folder), this update matches nothing and what was just created
+    // (container, files) is removed again instead of resurrecting the workspace.
+    const updated = await db.tenant(opts.orgId, (q) =>
+      q.query(`UPDATE workspaces SET state = 'ready', error = NULL WHERE id = $1 AND state = 'creating' RETURNING id`, [opts.workspaceId]),
     );
+    if (!updated.length) await discardWorkspaceFiles(paths.root, opts.workspaceId, opts.runtime);
+  } catch (err) {
+    await discardWorkspaceFiles(paths.root, opts.workspaceId, opts.runtime);
+    // A deleted workspace stays deleted (its clone usually fails because the folder vanished).
+    await db
+      .tenant(opts.orgId, (q) =>
+        q.query(`UPDATE workspaces SET state = 'failed', error = $2 WHERE id = $1 AND state = 'creating'`, [
+          opts.workspaceId,
+          String((err as Error).message).slice(0, 1000),
+        ]),
+      )
+      .catch(() => undefined);
   }
+}
+
+async function discardWorkspaceFiles(root: string, workspaceId: string, runtime: WorkspaceRuntime) {
+  await runtime.remove(workspaceId).catch(() => undefined);
+  await rm(root, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+}
+
+export const INTERRUPTED_SETUP_ERROR = 'Setup was interrupted by a server restart; delete and recreate the workspace.';
+
+/**
+ * At startup: a workspace still `creating` was being cloned by a server process that is gone,
+ * so it can never become ready. Marks each one failed (the owner can then delete and recreate
+ * it). Runs across organizations, so it uses the system connection. Returns how many.
+ */
+export async function recoverInterruptedWorkspaces(db: Database): Promise<number> {
+  const rows = await db.system((q) =>
+    q.query<{ id: string }>(`UPDATE workspaces SET state = 'failed', error = $1 WHERE state = 'creating' RETURNING id`, [INTERRUPTED_SETUP_ERROR]),
+  );
+  return rows.length;
 }
 
 export async function destroyWorkspaceFiles(workspacesDir: string, workspaceId: string, runtime: WorkspaceRuntime) {

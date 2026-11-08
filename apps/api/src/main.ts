@@ -9,6 +9,8 @@ import { Vault } from './vault/vault.js';
 import { readSdkPackage } from './agents/version.js';
 import { startIdleReaper } from './agents/housekeeping.js';
 import { defaultImage, DockerRuntime, localRuntime, type WorkspaceRuntime } from './workspaces/runtime.js';
+import { recoverInterruptedWorkspaces } from './workspaces/service.js';
+import { recoverInterruptedRuns } from './agents/recovery.js';
 
 const config = loadConfig();
 if (!config.DATABASE_URL) await mkdir(config.DATA_DIR, { recursive: true });
@@ -41,6 +43,13 @@ if (config.WORKSPACE_RUNTIME === 'docker') {
 
 const app = await buildApp({ config, db, vault, workspacesDir, runtime });
 if (applied.length) app.log.info({ applied }, 'applied migrations');
+// Workspaces that were still being cloned when the last server process stopped can never finish.
+const interruptedSetups = await recoverInterruptedWorkspaces(db);
+if (interruptedSetups) app.log.warn({ count: interruptedSetups }, 'marked workspaces interrupted during setup as failed');
+// Claude runs that were in progress when the last server process stopped: close them off so
+// their conversations show the interruption and can be resumed.
+const interruptedRuns = await recoverInterruptedRuns(db);
+if (interruptedRuns) app.log.warn({ count: interruptedRuns }, 'closed off Claude runs interrupted by a restart');
 if (runtime.kind === 'docker') {
   if (await DockerRuntime.available()) app.log.info('workspaces run in Docker containers');
   else app.log.warn('Docker is not running: workspaces cannot be opened until Docker Desktop is started');

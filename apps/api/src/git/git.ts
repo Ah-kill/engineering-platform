@@ -118,6 +118,15 @@ export function runGit(args: string[], opts: GitOptions): Promise<string> {
   });
 }
 
+/**
+ * For `.catch()` on a git command a user triggered: a GitError becomes a 400 carrying git's own
+ * message (the token is already redacted by runGit); anything else is rethrown unchanged.
+ */
+export function gitBadRequest(e: unknown): never {
+  if (e instanceof GitError) throw HttpError.badRequest(e.message);
+  throw e;
+}
+
 function redactToken(text: string, token?: string): string {
   return token ? text.split(token).join('***') : text;
 }
@@ -171,36 +180,92 @@ export interface FileStatus {
   status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked';
 }
 
-export async function status(cwd: string): Promise<{ branch: string; ahead: number; behind: number; files: FileStatus[] }> {
-  const out = await runGit(['status', '--porcelain=v1', '-b', '-z', '--untracked-files=all'], { cwd });
-  const parts = out.split('\0').filter(Boolean);
-  let branch = '';
-  let ahead = 0;
-  let behind = 0;
-  const files: FileStatus[] = [];
+export interface RepoStatus {
+  /** The checked-out branch, or '' when HEAD is detached (see `detached`). */
+  branch: string;
+  /** HEAD points at a commit, not a branch: push, pull, reset to GitHub and pull requests are refused. */
+  detached: boolean;
+  /** The commit HEAD points at, or null before the first commit. */
+  head: string | null;
+  ahead: number;
+  behind: number;
+  files: FileStatus[];
+}
+
+/** The text after the first `n` space-separated fields (paths may contain spaces). */
+function afterFields(entry: string, n: number): string {
+  let at = 0;
+  for (let i = 0; i < n; i++) {
+    at = entry.indexOf(' ', at) + 1;
+    if (at === 0) return '';
+  }
+  return entry.slice(at);
+}
+
+/**
+ * Parses `git status --porcelain=v2 -b -z`. Version 2 reports the branch on its own header line
+ * (`# branch.head <name>` or `(detached)`), so names with dots ("release-2.0", "feature/v1.2")
+ * come through whole.
+ */
+export async function status(cwd: string): Promise<RepoStatus> {
+  const out = await runGit(['status', '--porcelain=v2', '-b', '-z', '--untracked-files=all'], { cwd });
+  const parts = out.split('\0');
+  const result: RepoStatus = { branch: '', detached: false, head: null, ahead: 0, behind: 0, files: [] };
   for (let i = 0; i < parts.length; i++) {
     const entry = parts[i]!;
-    if (entry.startsWith('## ')) {
-      // A branch without commits yet (new, empty repository): "## No commits yet on <branch>".
-      const unborn = /^## (?:No commits yet|Initial commit) on (\S+)/.exec(entry);
-      if (unborn) {
-        branch = unborn[1]!.split('...')[0]!;
-        continue;
+    if (!entry) continue;
+    if (entry.startsWith('# ')) {
+      const [, key, ...rest] = entry.split(' ');
+      const value = rest.join(' ');
+      if (key === 'branch.oid') result.head = value === '(initial)' ? null : value;
+      else if (key === 'branch.head') {
+        result.detached = value === '(detached)';
+        result.branch = result.detached ? '' : value;
+      } else if (key === 'branch.ab') {
+        const m = /^\+(\d+) -(\d+)$/.exec(value);
+        result.ahead = Number(m?.[1] ?? 0);
+        result.behind = Number(m?.[2] ?? 0);
       }
-      const m = /^## ([^.\s]+)(?:\.\.\.\S+)?(?: \[(?:ahead (\d+))?(?:, )?(?:behind (\d+))?\])?/.exec(entry);
-      branch = m?.[1] ?? '';
-      ahead = Number(m?.[2] ?? 0);
-      behind = Number(m?.[3] ?? 0);
       continue;
     }
-    const code = entry.slice(0, 2);
-    const path = entry.slice(3);
-    if (code[0] === 'R') i++; // rename: next entry is the original path
+    let code: string;
+    let path: string;
+    switch (entry[0]) {
+      case '1': // ordinary change: "1 XY sub mH mI mW hH hI <path>"
+        code = entry.slice(2, 4);
+        path = afterFields(entry, 8);
+        break;
+      case '2': // rename or copy: "2 XY sub mH mI mW hH hI Xscore <path>", then the original path
+        code = entry.slice(2, 4);
+        path = afterFields(entry, 9);
+        i++;
+        break;
+      case 'u': // unmerged: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>"
+        code = entry.slice(2, 4);
+        path = afterFields(entry, 10);
+        break;
+      case '?':
+        code = '??';
+        path = entry.slice(2);
+        break;
+      default: // '!' (ignored; not requested) or anything unknown
+        continue;
+    }
+    // Version 2 writes "." for an unchanged side; keep the familiar v1 codes (" M", "A ").
+    code = code.replace(/\./g, ' ');
     const s: FileStatus['status'] =
       code === '??' ? 'untracked' : code.includes('D') ? 'deleted' : code.includes('A') ? 'added' : code.includes('R') ? 'renamed' : 'modified';
-    files.push({ path, code, status: s });
+    if (path) result.files.push({ path, code, status: s });
   }
-  return { branch, ahead, behind, files };
+  return result;
+}
+
+/** The checked-out branch for commands that act on it; refuses a detached HEAD with a clear 400. */
+export function requireBranch(s: Pick<RepoStatus, 'branch' | 'detached'>, action: string): string {
+  if (s.detached || !s.branch) {
+    throw HttpError.badRequest(`HEAD is detached (no branch is checked out), so the platform cannot ${action}. Check out a branch first.`);
+  }
+  return assertBranch(s.branch);
 }
 
 export async function branches(cwd: string): Promise<{ current: string; local: string[]; remote: string[] }> {

@@ -5,10 +5,10 @@ import { HttpError } from '../http/errors.js';
  * Monthly Claude budgets per developer.
  *
  * The limit is the developer's own override (user_budgets) or else the organisation's
- * default (organizations.monthly_budget_usd); null means no limit. Spend is the sum of
- * agent_sessions.cost_usd for conversations the developer started in the current UTC
- * calendar month, the same day-bucketing as the Usage page (a conversation counts in the
- * month it started, including cost added later).
+ * default (organizations.monthly_budget_usd); null means no limit. Spend is the cost of
+ * every Claude run that finished in the current UTC calendar month in the developer's
+ * conversations: the `costUsd` of their `result` events. Counting by run, not by when the
+ * conversation started, means resuming an older conversation still counts this month.
  */
 
 export interface BudgetStatus {
@@ -38,19 +38,44 @@ export function monthBounds(now: Date = new Date()): { start: Date; end: Date; m
 /** Rounds to whole cents, which is what the database stores. */
 export const cents = (n: number) => Math.round(n * 100) / 100;
 
+/**
+ * This month's spend for user $2 in org $1, between $3 (inclusive) and $4 (exclusive): the
+ * cost of each run (`result` event) recorded in that window. Uses agent_events_result_idx.
+ */
+const SPENT_SQL = `SELECT coalesce(sum(CASE WHEN jsonb_typeof(e.data->'costUsd') = 'number' THEN (e.data->>'costUsd')::numeric ELSE 0 END), 0)::float8
+       FROM agent_events e JOIN agent_sessions s ON s.id = e.session_id AND s.org_id = e.org_id
+      WHERE e.org_id = $1 AND e.kind = 'result' AND s.user_id = $2
+        AND e.created_at >= $3::timestamptz AND e.created_at < $4::timestamptz`;
+
+/**
+ * This month's spend per user in the caller's org (RLS), same rules as `budgetDetail`, for
+ * lists of developers. Call inside `db.tenant(orgId, …)`.
+ */
+export async function spendByUser(q: Queryable, now: Date = new Date()): Promise<Map<string, number>> {
+  const { start, end } = monthBounds(now);
+  const rows = await q.query<{ userId: string; spent: number }>(
+    `SELECT s.user_id AS "userId",
+            sum(CASE WHEN jsonb_typeof(e.data->'costUsd') = 'number' THEN (e.data->>'costUsd')::numeric ELSE 0 END)::float8 AS spent
+       FROM agent_events e JOIN agent_sessions s ON s.id = e.session_id AND s.org_id = e.org_id
+      WHERE e.kind = 'result' AND e.created_at >= $1::timestamptz AND e.created_at < $2::timestamptz
+      GROUP BY s.user_id`,
+    [start.toISOString(), end.toISOString()],
+  );
+  return new Map(rows.map((r) => [r.userId, Math.round(r.spent * 1e6) / 1e6]));
+}
+
 export async function budgetDetail(q: Queryable, orgId: string, userId: string, now: Date = new Date()): Promise<BudgetDetail> {
   const { start, end, month } = monthBounds(now);
   const [row] = await q.query<{ override: number | null; fallback: number | null; spent: number }>(
     `SELECT (SELECT ub.monthly_budget_usd::float8 FROM user_budgets ub WHERE ub.user_id = $2 AND ub.org_id = $1) AS override,
             (SELECT o.monthly_budget_usd::float8 FROM organizations o WHERE o.id = $1) AS fallback,
-            (SELECT coalesce(sum(s.cost_usd), 0)::float8 FROM agent_sessions s
-              WHERE s.org_id = $1 AND s.user_id = $2 AND s.created_at >= $3::timestamptz AND s.created_at < $4::timestamptz) AS spent`,
+            (${SPENT_SQL}) AS spent`,
     [orgId, userId, start.toISOString(), end.toISOString()],
   );
   const overrideUsd = row?.override ?? null;
   const defaultUsd = row?.fallback ?? null;
   const limitUsd = overrideUsd ?? defaultUsd;
-  // cost_usd has 6 decimals; compare and report in micro-dollars to avoid float noise.
+  // Compare and report in micro-dollars (cost_usd's precision) to avoid float noise.
   const spentUsd = Math.round((row?.spent ?? 0) * 1e6) / 1e6;
   return { limitUsd, spentUsd, allowed: limitUsd === null || spentUsd < limitUsd, overrideUsd, defaultUsd, month };
 }

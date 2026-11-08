@@ -210,6 +210,15 @@ describe('Claude runs in a shared workspace', () => {
     const run = await editor.post(`/api/workspaces/${wsId}/agent/run`, { prompt: 'clean', mode: 'execute' });
     expect(run.statusCode, run.body).toBe(200);
     const request = await waitFor(async () => (await events(run.json().sessionId)).find((e) => e.kind === 'approval_request'));
+    // Everyone sees that Claude is busy and for whom; only the editor is pointed at the
+    // conversation (the owner could not open it, and must not auto-select it).
+    expect((await owner.get(`/api/workspaces/${wsId}/agent/sessions`)).json()).toMatchObject({
+      running: true, activeSessionId: null, runningBy: { name: 'editor', you: false },
+    });
+    expect((await editor.get(`/api/workspaces/${wsId}/agent/sessions`)).json()).toMatchObject({
+      running: true, activeSessionId: run.json().sessionId, runningBy: { name: 'editor', you: true },
+    });
+    expect((await owner.get(`/api/agent/sessions/${run.json().sessionId}/events`)).statusCode).toBe(404);
     // The owner cannot answer the editor's approval...
     expect((await owner.post(`/api/workspaces/${wsId}/agent/approvals/${request.data.approvalId}`, { allow: true })).statusCode).toBe(404);
     // ...and cannot open a terminal into the container while the editor's run is active.

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -499,5 +499,131 @@ describe('pull requests', () => {
     const r = await dev.post(`/api/workspaces/${wsId}/pull-request`, { title: 'Retries' });
     expect(r.statusCode, r.body).toBe(200);
     expect(ghCalls[0]).toMatchObject({ token: ACME_TOKEN, body: expect.objectContaining({ head: 'feature/retry', base: 'main' }) });
+  });
+});
+
+describe('branch names with dots and a detached HEAD', () => {
+  let dotWs: string;
+  const repoOf = (id: string) => path.join(env.workspacesDir, id, 'repo');
+  const pushStub: GhHandler = (c) => {
+    if (c.url.includes('/branches/')) return { body: { protected: false } };
+    if (c.method === 'POST' && c.url === '/repos/acme/payments/pulls') return { status: 201, body: { number: 9, html_url: 'https://github.com/acme/payments/pull/9' } };
+    return undefined;
+  };
+
+  it('keeps the whole branch name for status, push, pull, reset and pull requests', async () => {
+    dotWs = await createWorkspace(dev, appId, devEnvId, 'release-2.0');
+    const s = (await dev.get(`/api/workspaces/${dotWs}/git/status`)).json();
+    expect(s).toMatchObject({ branch: 'release-2.0', detached: false, head: expect.stringMatching(/^[0-9a-f]{40}$/) });
+
+    await dev.request('PUT', `/api/workspaces/${dotWs}/file`, { path: 'notes v1.txt', content: 'dotted\n' });
+    expect((await dev.get(`/api/workspaces/${dotWs}/git/status`)).json().files).toEqual([{ path: 'notes v1.txt', code: '??', status: 'untracked' }]);
+    expect((await dev.post(`/api/workspaces/${dotWs}/git/commit`, { message: 'Dotted' })).statusCode).toBe(200);
+    expect((await dev.get(`/api/workspaces/${dotWs}/git/status`)).json()).toMatchObject({ branch: 'release-2.0', files: [] });
+
+    stubGithub(pushStub);
+    const push = await dev.post(`/api/workspaces/${dotWs}/git/push`);
+    expect(push.statusCode, push.body).toBe(200);
+    expect(push.json().branch).toBe('release-2.0');
+    expect(ghCalls[0]!.url).toBe('/repos/acme/payments/branches/release-2.0');
+    const remote = await runGit(['for-each-ref', '--format=%(refname)', 'refs/heads'], { cwd: bare });
+    expect(remote.split('\n')).toContain('refs/heads/release-2.0');
+    expect(remote.split('\n')).not.toContain('refs/heads/release-2');
+    expect((await dev.get(`/api/workspaces/${dotWs}/git/status`)).json()).toMatchObject({ ahead: 0, behind: 0 });
+
+    expect((await dev.post(`/api/workspaces/${dotWs}/git/pull`)).statusCode).toBe(200);
+    expect((await dev.post(`/api/workspaces/${dotWs}/git/reset`, { to: 'remote' })).statusCode).toBe(200);
+    const pr = await dev.post(`/api/workspaces/${dotWs}/pull-request`, { title: 'Release' });
+    expect(pr.statusCode, pr.body).toBe(200);
+    expect(ghCalls.at(-1)!.body).toMatchObject({ head: 'release-2.0' });
+
+    // A dotted name after a slash, created in the workspace.
+    expect((await dev.post(`/api/workspaces/${dotWs}/git/checkout`, { branch: 'feature/v1.2', create: true })).statusCode).toBe(200);
+    expect((await dev.get(`/api/workspaces/${dotWs}/git/status`)).json().branch).toBe('feature/v1.2');
+    expect((await dev.post(`/api/workspaces/${dotWs}/git/push`)).statusCode).toBe(200);
+    expect((await runGit(['for-each-ref', '--format=%(refname)', 'refs/heads'], { cwd: bare })).split('\n')).toContain('refs/heads/feature/v1.2');
+  });
+
+  it('reports a detached HEAD and refuses push, pull, reset to GitHub and pull requests', async () => {
+    await runGit(['checkout', '-q', '--detach'], { cwd: repoOf(dotWs) });
+    const s = (await dev.get(`/api/workspaces/${dotWs}/git/status`)).json();
+    expect(s).toMatchObject({ branch: '', detached: true, head: expect.stringMatching(/^[0-9a-f]{40}$/) });
+
+    stubGithub(pushStub);
+    const before = await runGit(['for-each-ref', '--format=%(refname)', 'refs/heads'], { cwd: bare });
+    const attempts: [string, object][] = [
+      ['git/push', {}],
+      ['git/pull', {}],
+      ['git/reset', { to: 'remote' }],
+      ['pull-request', { title: 'Detached' }],
+    ];
+    for (const [url, body] of attempts) {
+      const r = await dev.post(`/api/workspaces/${dotWs}/${url}`, body);
+      expect(r.statusCode, `${url}: ${r.body}`).toBe(400);
+      expect(r.json().error.message).toMatch(/detached/i);
+    }
+    expect(ghCalls).toEqual([]);
+    expect(await runGit(['for-each-ref', '--format=%(refname)', 'refs/heads'], { cwd: bare })).toBe(before);
+    expect(before).not.toContain('refs/heads/HEAD');
+
+    // Discarding local changes still works without a branch.
+    expect((await dev.post(`/api/workspaces/${dotWs}/git/reset`, { to: 'head' })).statusCode).toBe(200);
+    await runGit(['checkout', '-q', 'feature/v1.2'], { cwd: repoOf(dotWs) });
+    expect((await dev.get(`/api/workspaces/${dotWs}/git/status`)).json()).toMatchObject({ branch: 'feature/v1.2', detached: false });
+  });
+});
+
+describe('git errors are explained', () => {
+  let errWs: string;
+  const gitDirOf = (id: string) => path.join(env.workspacesDir, id, 'git');
+
+  it('fetch failures come back as a 400 with the git message and no token', async () => {
+    errWs = await createWorkspace(dev, appId, devEnvId, 'feature/errors');
+    const moved = `${bare}-moved`;
+    await rename(bare, moved);
+    try {
+      const r = await dev.post(`/api/workspaces/${errWs}/git/fetch`);
+      expect(r.statusCode, r.body).toBe(400);
+      expect(r.json().error.message).toMatch(/^git fetch failed: /);
+      expect(r.body).not.toContain(ACME_TOKEN);
+    } finally {
+      await rename(moved, bare);
+    }
+    expect((await dev.post(`/api/workspaces/${errWs}/git/fetch`)).statusCode).toBe(200);
+  });
+
+  it('commit and discard failures come back as a 400 with the git message', async () => {
+    await dev.request('PUT', `/api/workspaces/${errWs}/file`, { path: 'retry.js', content: 'changed\n' });
+    const lock = path.join(gitDirOf(errWs), 'index.lock');
+    await writeFile(lock, '');
+    try {
+      const commit = await dev.post(`/api/workspaces/${errWs}/git/commit`, { message: 'Blocked' });
+      expect(commit.statusCode, commit.body).toBe(400);
+      expect(commit.json().error.message).toMatch(/^git (add|commit) failed: .*try again/);
+      const discard = await dev.post(`/api/workspaces/${errWs}/git/discard`, { path: 'retry.js' });
+      expect(discard.statusCode, discard.body).toBe(400);
+      expect(discard.json().error.message).toMatch(/^git restore failed: .*try again/);
+    } finally {
+      await rm(lock, { force: true });
+    }
+    expect((await dev.post(`/api/workspaces/${errWs}/git/discard`, { path: 'retry.js' })).statusCode).toBe(200);
+    expect((await dev.get(`/api/workspaces/${errWs}/git/status`)).json().files).toEqual([]);
+  });
+
+  it('discard is refused while Claude is working', async () => {
+    await dev.request('PUT', `/api/workspaces/${errWs}/file`, { path: 'retry.js', content: 'changed again\n' });
+    script = async function* (input) {
+      const signal = input.abortController.signal;
+      if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve()));
+      throw new Error('aborted');
+    };
+    const run = await dev.post(`/api/workspaces/${errWs}/agent/run`, { prompt: 'busy', mode: 'execute' });
+    expect(run.statusCode, run.body).toBe(200);
+    await waitFor(async () => ((await dev.get(`/api/workspaces/${errWs}/agent/sessions`)).json().running ? true : undefined));
+    expect((await dev.post(`/api/workspaces/${errWs}/git/discard`, { path: 'retry.js' })).statusCode).toBe(409);
+    await dev.post(`/api/workspaces/${errWs}/agent/cancel`);
+    await waitFor(async () => ((await dev.get(`/api/workspaces/${errWs}/agent/sessions`)).json().running ? undefined : true));
+    expect((await dev.get(`/api/workspaces/${errWs}/file?path=retry.js`)).json().content).toBe('changed again\n');
+    expect((await dev.post(`/api/workspaces/${errWs}/git/discard`, { path: 'retry.js' })).statusCode).toBe(200);
   });
 });

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { authorize, requirePermission } from '../access/authorize.js';
 import { audit } from '../audit/audit.js';
 import { caller, type RouteDeps } from '../http/app.js';
-import { HttpError, mapDbError } from '../http/errors.js';
+import { HttpError } from '../http/errors.js';
 import { principalOf } from '../identity/user-routes.js';
 import * as git from '../git/git.js';
 import {
@@ -168,13 +168,11 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
       );
       if (!repo) throw HttpError.badRequest('Connect a repository to this application first');
       const baseBranch = git.assertBranch(body.baseBranch || repo.default_branch);
-      const [ws] = await q
-        .query<{ id: string }>(
-          `INSERT INTO workspaces (org_id, application_id, environment_id, repository_id, owner_id, branch, base_branch)
-           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-          [user.orgId, id, body.environmentId, repo.id, user.id, body.branch, baseBranch],
-        )
-        .catch((e) => mapDbError(e, 'Workspace already exists'));
+      const [ws] = await q.query<{ id: string }>(
+        `INSERT INTO workspaces (org_id, application_id, environment_id, repository_id, owner_id, branch, base_branch)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+        [user.orgId, id, body.environmentId, repo.id, user.id, body.branch, baseBranch],
+      );
       const [app_] = await q.query<{ client_id: string }>('SELECT client_id FROM applications WHERE id = $1', [id]);
       await audit(q, {
         orgId: user.orgId, actorId: user.id, action: 'workspace.created', resourceType: 'workspace', resourceId: ws!.id,
@@ -397,6 +395,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
   app.post('/workspaces/:id/git/discard', async (req) => {
     const { paths, row, user } = await ws(req);
     const { path } = pathQuery.parse(req.body);
+    refuseWhileRunning(row);
     await resolveInRepo(paths.repo, path);
     await withWorkspaceLock(row.id, async () => {
       const s = await git.status(paths.repo);
@@ -406,7 +405,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
         await git.runGit(['rm', '--cached', '-q', '--ignore-unmatch', '--', path], { cwd: paths.repo }).catch(() => undefined);
         await deleteRepoPath(paths.repo, path);
       } else {
-        await git.runGit(['restore', '--source=HEAD', '--staged', '--worktree', '--', path], { cwd: paths.repo });
+        await git.runGit(['restore', '--source=HEAD', '--staged', '--worktree', '--', path], { cwd: paths.repo }).catch(git.gitBadRequest);
       }
     });
     await auditWs(user, row, 'git.discard', { path });
@@ -426,7 +425,8 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     refuseWhileRunning(row);
     const branch = await withWorkspaceLock(row.id, async () => {
       const s = await git.status(paths.repo);
-      const current = git.assertBranch(s.branch);
+      // Resetting to HEAD works on a detached HEAD too; resetting to GitHub needs a branch.
+      const current = to === 'remote' ? git.requireBranch(s, 'reset it to GitHub') : s.detached ? null : s.branch;
       let target = 'HEAD';
       if (to === 'remote') {
         const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
@@ -457,7 +457,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     const { paths, row, user } = await ws(req);
     await withWorkspaceLock(row.id, async () => {
       const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
-      await git.runGit(['fetch', '--prune', '--no-recurse-submodules', 'origin'], { cwd: paths.repo, ...auth });
+      await git.runGit(['fetch', '--prune', '--no-recurse-submodules', 'origin'], { cwd: paths.repo, ...auth }).catch(git.gitBadRequest);
     });
     return git.branches(paths.repo);
   });
@@ -465,9 +465,9 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
   app.post('/workspaces/:id/git/pull', async (req) => {
     const { paths, row, user } = await ws(req);
     const s = await git.status(paths.repo);
+    const branch = git.requireBranch(s, 'pull');
     const out = await withWorkspaceLock(row.id, async () => {
       const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
-      const branch = git.assertBranch(s.branch);
       // Fetch with the token, then merge without it: merging checks files out, which can
       // run filter programs, and those must never see the token.
       await git.runGit(['fetch', '--no-recurse-submodules', 'origin', `refs/heads/${branch}`], { cwd: paths.repo, ...auth }).catch((e: git.GitError) => {
@@ -478,7 +478,7 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
         throw HttpError.badRequest(e.message);
       });
     });
-    await auditWs(user, row, 'git.pull', { branch: s.branch });
+    await auditWs(user, row, 'git.pull', { branch });
     return { output: out };
   });
 
@@ -508,8 +508,10 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
     const sha = await withWorkspaceLock(row.id, async () => {
       const s = await git.status(paths.repo);
       if (!s.files.length) throw HttpError.badRequest('There are no changes to commit');
-      await git.runGit(['add', '-A'], { cwd: paths.repo });
-      await git.runGit(['commit', '-q', '-m', message], { cwd: paths.repo, author: { name: user.displayName, email: user.email } });
+      await git.runGit(['add', '-A'], { cwd: paths.repo }).catch(git.gitBadRequest);
+      await git
+        .runGit(['commit', '-q', '-m', message], { cwd: paths.repo, author: { name: user.displayName, email: user.email } })
+        .catch(git.gitBadRequest);
       return (await git.runGit(['rev-parse', 'HEAD'], { cwd: paths.repo })).trim();
     });
     await auditWs(user, row, 'git.commit', { sha, message: message.slice(0, 200) });
@@ -519,11 +521,11 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
   app.post('/workspaces/:id/git/push', async (req) => {
     const { paths, row, user } = await ws(req);
     const s = await git.status(paths.repo);
+    const branch = git.requireBranch(s, 'push');
     const refusal = (b: string) => HttpError.forbidden(`Pushing directly to "${b}" is not allowed. Push a feature branch and open a pull request.`);
-    if (s.branch === row.defaultBranch || PROTECTED_BRANCHES.has(s.branch)) throw refusal(s.branch);
+    if (branch === row.defaultBranch || PROTECTED_BRANCHES.has(branch)) throw refusal(branch);
     await withWorkspaceLock(row.id, async () => {
       const auth = await tokenGit(row, paths.repo, user.id, user.orgId);
-      const branch = git.assertBranch(s.branch);
       // Branches protected on GitHub are refused here too, not only the names above.
       if (auth.token) {
         const isProtected = await isBranchProtected(auth.token, row.repoOwner, row.repoName, branch).catch((e: Error) => {
@@ -535,8 +537,8 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
         throw HttpError.badRequest(e.message);
       });
     });
-    await auditWs(user, row, 'git.push', { branch: s.branch });
-    return { ok: true, branch: s.branch };
+    await auditWs(user, row, 'git.push', { branch });
+    return { ok: true, branch };
   });
 
   // ---- pull requests ------------------------------------------------------
@@ -544,12 +546,12 @@ export async function workspaceRoutes(app: FastifyInstance, deps: RouteDeps) {
   app.post('/workspaces/:id/pull-request', async (req) => {
     const { paths, row, user } = await ws(req);
     const body = prBody.parse(req.body);
+    const head = git.requireBranch(await git.status(paths.repo), 'open a pull request');
     const token = await apiToken(user, row, 'open pull requests');
-    const s = await git.status(paths.repo);
     const pr = await createPullRequest(token, row.repoOwner, row.repoName, {
-      title: body.title, body: body.body, head: s.branch, base: row.baseBranch, draft: body.draft,
+      title: body.title, body: body.body, head, base: row.baseBranch, draft: body.draft,
     });
-    await auditWs(user, row, 'git.pull_request', { number: pr.number, head: s.branch, base: row.baseBranch });
+    await auditWs(user, row, 'git.pull_request', { number: pr.number, head, base: row.baseBranch });
     return { number: pr.number, url: pr.html_url };
   });
 
